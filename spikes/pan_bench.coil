@@ -1,0 +1,200 @@
+(module pan-bench)
+
+(import "coil.primitive" :as primitive)
+(import "coil.io" :use *)
+(import "coil.fmt" :use *)
+(import "coil.str" :use *)
+
+(extern objc_getClass :cc c [(ptr i8)] (-> (ptr i8)))
+(extern sel_registerName :cc c [(ptr i8)] (-> (ptr i8)))
+(extern objc_msgSend :cc c [(ptr i8) (ptr i8)] (-> (ptr i8)))
+(extern CFStringCreateWithCString :cc c [(ptr i8) (ptr i8) u32] (-> (ptr i8)))
+(extern CFStringGetCString :cc c [(ptr i8) (ptr i8) i64 u32] (-> u8))
+(extern CFArrayGetCount :cc c [(ptr i8)] (-> i64))
+(extern CFArrayGetValueAtIndex :cc c [(ptr i8) i64] (-> (ptr i8)))
+(extern CFRetain :cc c [(ptr i8)] (-> (ptr i8)))
+(extern CFEqual :cc c [(ptr i8) (ptr i8)] (-> u8))
+(extern CFBooleanGetValue :cc c [(ptr i8)] (-> u8))
+(extern AXUIElementCreateApplication :cc c [i32] (-> (ptr i8)))
+(extern AXUIElementCopyAttributeValue :cc c [(ptr i8) (ptr i8) (ptr (ptr i8))] (-> i32))
+(extern AXUIElementSetAttributeValue :cc c [(ptr i8) (ptr i8) (ptr i8)] (-> i32))
+(extern AXValueGetValue :cc c [(ptr i8) i32 (ptr i8)] (-> u8))
+(extern AXValueCreate :cc c [i32 (ptr i8)] (-> (ptr i8)))
+(extern mach_absolute_time :cc c [] (-> u64))
+(extern usleep :cc c [u32] (-> i32))
+
+(defstruct CGPoint [(x f64) (y f64)])
+
+(const MAXW 128)
+(const UTF8 134217984)
+
+(defn null [] (-> (ptr i8)) (primitive/cast (ptr i8) 0))
+
+(defn cfstr [(s (ptr i8))] (-> (ptr i8))
+  (CFStringCreateWithCString (null) s (primitive/cast u32 UTF8)))
+
+(defn sel [(s (ptr i8))] (-> (ptr i8)) (sel_registerName s))
+
+(defn send-i64 [(recv (ptr i8)) (s (ptr i8)) (a i64)] (-> (ptr i8))
+  (primitive/call-ptr (primitive/cast (fnptr c [(ptr i8) (ptr i8) i64] (ptr i8)) (primitive/fnptr-of objc_msgSend))
+                      recv (sel s) a))
+
+(defn send-ret-i64 [(recv (ptr i8)) (s (ptr i8))] (-> i64)
+  (primitive/call-ptr (primitive/cast (fnptr c [(ptr i8) (ptr i8)] i64) (primitive/fnptr-of objc_msgSend))
+                      recv (sel s)))
+
+(defn send-pid [(recv (ptr i8))] (-> i32)
+  (primitive/call-ptr (primitive/cast (fnptr c [(ptr i8) (ptr i8)] i32) (primitive/fnptr-of objc_msgSend))
+                      recv (sel c"processIdentifier")))
+
+(defn ax-get [(el (ptr i8)) (attr (ptr i8))] (-> (ptr i8))
+  (let [out (primitive/alloc-stack (ptr i8))]
+    (do
+      (primitive/store! out (null))
+      (if (= (AXUIElementCopyAttributeValue el (cfstr attr) out) (primitive/cast i32 0))
+          (primitive/load out)
+          (null)))))
+
+(defn get-pos [(w (ptr i8)) (out (ptr CGPoint))] (-> i64)
+  (let [v (ax-get w c"AXPosition")]
+    (if (= v (null))
+        -1
+        (do (AXValueGetValue v (primitive/cast i32 1) (primitive/cast (ptr i8) out)) 0))))
+
+(defn set-pos [(w (ptr i8)) (x f64) (y f64)] (-> i32)
+  (let [(mut p) (CGPoint :x x :y y)]
+    (AXUIElementSetAttributeValue w (cfstr c"AXPosition")
+                                  (AXValueCreate (primitive/cast i32 1) (primitive/cast (ptr i8) (mut p))))))
+
+(defn us-since [(t0 u64)] (-> i64)
+  (primitive/cast i64 (/ (- (mach_absolute_time) t0) (primitive/cast u64 24))))
+
+(defn cf-is [(v (ptr i8)) (s (ptr i8))] (-> bool)
+  (if (= v (null)) false (!= (CFEqual v (cfstr s)) (primitive/cast u8 0))))
+
+(defn main [] (-> i64)
+  (let [wins (primitive/alloc-stack (array (ptr i8) 128))
+        names (primitive/alloc-stack (array (ptr i8) 128))
+        orig (primitive/alloc-stack (array CGPoint 128))
+        ws (objc_msgSend (objc_getClass c"NSWorkspace") (sel c"sharedWorkspace"))
+        apps (objc_msgSend ws (sel c"runningApplications"))
+        napps (send-ret-i64 apps c"count")
+        (mut n) 0
+        (mut ai) 0]
+    (do
+      ; ---- collect standard, non-minimized windows on the current space ----
+      (while (< (load ai) napps)
+        (let [a (send-i64 apps c"objectAtIndex:" (load ai))]
+          (do
+            (if (= (send-ret-i64 a c"activationPolicy") 0)
+                (let [app (AXUIElementCreateApplication (send-pid a))
+                      eui (ax-get app c"AXEnhancedUserInterface")
+                      name (objc_msgSend (objc_msgSend a (sel c"localizedName")) (sel c"UTF8String"))
+                      list (ax-get app c"AXWindows")]
+                  (do
+                    (if (= eui (null)) 0
+                        (if (= (CFBooleanGetValue eui) (primitive/cast u8 0)) 0
+                            (do (println "note: {s} has AXEnhancedUserInterface=1 (moves may animate)" (from-cstr name)) 0)))
+                    (if (= list (null))
+                        0
+                        (let [cnt (CFArrayGetCount list)
+                              (mut j) 0]
+                          (do
+                            (while (< (load j) cnt)
+                              (let [w (CFArrayGetValueAtIndex list (load j))
+                                    std (cf-is (ax-get w c"AXSubrole") c"AXStandardWindow")
+                                    minv (ax-get w c"AXMinimized")
+                                    mini (if (= minv (null)) false (!= (CFBooleanGetValue minv) (primitive/cast u8 0)))]
+                                (do
+                                  (if (and std (not mini) (< (load n) MAXW))
+                                      (do
+                                        (CFRetain w)
+                                        (set! (index wins (load n)) w)
+                                        (set! (index names (load n)) name)
+                                        (get-pos w (primitive/cast (ptr CGPoint) (index orig (load n))))
+                                        (set! n (+ (load n) 1))
+                                        0)
+                                      0)
+                                  (set! j (+ (load j) 1)))))
+                            0)))))
+                0)
+            (set! ai (+ (load ai) 1)))))
+      (println "windows: {d}  (original positions follow, for manual restore)" (load n))
+      (let [(mut i) 0]
+        (while (< (load i) (load n))
+          (do
+            (println "  [{d}] {s} @ ({f},{f})" (load i) (from-cstr (load (index names (load i))))
+                     (.x (index orig (load i))) (.y (index orig (load i))))
+            (set! i (+ (load i) 1)))))
+      ; ---- phase A: per-window latency, 20 moves of +8px ----
+      (println "\n-- per-window: 20 moves each (us) --")
+      (let [(mut i) 0]
+        (while (< (load i) (load n))
+          (let [w (load (index wins (load i)))
+                ox (.x (index orig (load i)))
+                oy (.y (index orig (load i)))
+                (mut k) 1
+                (mut total) 0
+                (mut worst) 0
+                (mut errs) 0]
+            (do
+              (while (<= (load k) 20)
+                (let [t0 (mach_absolute_time)
+                      err (set-pos w (+ ox (primitive/cast f64 (* 8 (load k)))) oy)
+                      dt (us-since t0)]
+                  (do
+                    (set! total (+ (load total) dt))
+                    (if (> dt (load worst)) (set! worst dt) 0)
+                    (if (!= err (primitive/cast i32 0)) (set! errs (+ (load errs) 1)) 0)
+                    (set! k (+ (load k) 1)))))
+              (set-pos w ox oy)
+              (println "  [{d}] {s}: avg {d}  max {d}  errors {d}" (load i) (from-cstr (load (index names (load i))))
+                       (/ (load total) 20) (load worst) (load errs))
+              (set! i (+ (load i) 1))))))
+      ; ---- phase B: whole-canvas pan, 30 frames moving every window +6px ----
+      (println "\n-- whole pan: 30 frames moving all {d} windows (us per frame) --" (load n))
+      (let [(mut f) 1
+            (mut total) 0
+            (mut worst) 0]
+        (do
+          (while (<= (load f) 30)
+            (let [t0 (mach_absolute_time)
+                  (mut i) 0]
+              (do
+                (while (< (load i) (load n))
+                  (do
+                    (set-pos (load (index wins (load i)))
+                             (+ (.x (index orig (load i))) (primitive/cast f64 (* 6 (load f))))
+                             (.y (index orig (load i))))
+                    (set! i (+ (load i) 1))))
+                (let [dt (us-since t0)]
+                  (do
+                    (set! total (+ (load total) dt))
+                    (if (> dt (load worst)) (set! worst dt) 0)
+                    (usleep (primitive/cast u32 8000))
+                    (set! f (+ (load f) 1)))))))
+          (println "  avg frame {d} us, worst frame {d} us (16667 us = 60fps budget)" (/ (load total) 30) (load worst))))
+      ; ---- restore everything, then verify ----
+      (let [(mut i) 0
+            (mut off) 0
+            q (primitive/alloc-stack CGPoint)]
+        (do
+          (while (< (load i) (load n))
+            (do
+              (set-pos (load (index wins (load i))) (.x (index orig (load i))) (.y (index orig (load i))))
+              (set! i (+ (load i) 1))))
+          (usleep (primitive/cast u32 300000))
+          (set! i 0)
+          (while (< (load i) (load n))
+            (do
+              (get-pos (load (index wins (load i))) q)
+              (if (or (!= (.x q) (.x (index orig (load i)))) (!= (.y q) (.y (index orig (load i)))))
+                  (do
+                    (println "  NOT RESTORED [{d}] now ({f},{f}); retrying" (load i) (.x q) (.y q))
+                    (set-pos (load (index wins (load i))) (.x (index orig (load i))) (.y (index orig (load i))))
+                    (set! off (+ (load off) 1))
+                    0)
+                  0)
+              (set! i (+ (load i) 1))))
+          (println "\nrestored; {d} needed a retry" (load off))
+          0)))))

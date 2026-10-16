@@ -1,0 +1,87 @@
+(module wm.watchdog)
+
+;;; The window manager runs as a child of a small watchdog process. If the
+;;; child dies without cleaning up — force quit, crash — windows it left off
+;;; screen would be stranded, so the watchdog brings them back. Signals sent to
+;;; the watchdog (Ctrl-C, kill) are passed to the child, which quits cleanly.
+
+(import "coil.primitive" :as primitive)
+(import "wm.objc" :use [nil nil?])
+(import "wm.rescue" :as rescue)
+
+(extern getenv :cc c [(ptr i8)] (-> (ptr i8)))
+
+(extern setenv :cc c [(ptr i8) (ptr i8) i32] (-> i32))
+
+(extern posix_spawn
+        :cc
+        c
+        [(ptr i32) (ptr i8) (ptr i8) (ptr i8) (ptr (ptr i8)) (ptr (ptr i8))]
+        (-> i32))
+
+(extern _NSGetEnviron :cc c [] (-> (ptr (ptr (ptr i8)))))
+
+(extern _NSGetExecutablePath :cc c [(ptr i8) (ptr u32)] (-> i32))
+
+(extern waitpid :cc c [i32 (ptr i32) i32] (-> i32))
+
+(extern kill :cc c [i32 i32] (-> i32))
+
+(extern signal :cc c [i32 (fnptr c [i32] void)] (-> (ptr i8)))
+
+(const SIGHUP 1)
+
+(const SIGINT 2)
+
+(const SIGTERM 15)
+
+(defn child [] (-> (ptr i32))
+  (primitive/alloc-static i32))
+
+;;; True in the worker process the watchdog started.
+(defn worker? [] (-> bool)
+  (not (nil? (getenv c"WM_WORKER"))))
+
+(defn forward [(signum i32)] (-> void)
+  (do (kill (load (child)) signum) (forget 0)))
+
+;;; Run this executable again as the worker and wait for it. Returns the exit
+;;; code to use. Call before anything touches AppKit.
+(defn supervise! [(argv (ptr (ptr i8)))] (-> i64)
+  (let [(mut path) (zeroed (array i8 4096))
+        (mut size) (primitive/cast u32 4096)
+        (mut pid) (primitive/cast i32 0)
+        (mut status) (primitive/cast i32 0)]
+    (do
+      (if (!= (_NSGetExecutablePath (primitive/cast (ptr i8) (mut path))
+                                    (mut size))
+              (primitive/cast i32 0))
+          (panic "watchdog: executable path too long")
+          0)
+      (setenv c"WM_WORKER" c"1" (primitive/cast i32 1))
+      (if (!= (posix_spawn (mut pid)
+                           (primitive/cast (ptr i8) (mut path))
+                           (nil)
+                           (nil)
+                           argv
+                           (load (_NSGetEnviron)))
+              (primitive/cast i32 0))
+          (panic "watchdog: could not start the window manager")
+          0)
+      (set! (child) (load pid))
+      (signal (primitive/cast i32 SIGINT) (fnptr-of forward))
+      (signal (primitive/cast i32 SIGTERM) (fnptr-of forward))
+      (signal (primitive/cast i32 SIGHUP) (fnptr-of forward))
+      ;; retry when a forwarded signal interrupts the wait
+      (while (< (waitpid (load pid) (mut status) (primitive/cast i32 0))
+                (primitive/cast i32 0))
+        0)
+      (let [s (primitive/cast i64 (load status))
+            signalled (!= (& s 127) 0)
+            code (& (>> s 8) 255)]
+        (if (or signalled (!= code 0))
+            (do
+              (println "[watchdog] the window manager stopped without cleaning up; bringing windows back")
+              (rescue/rescue-lost-windows!)
+              1)
+            0)))))

@@ -1,0 +1,239 @@
+(module wm.input)
+
+;;; Global input through a CGEventTap on the main run loop:
+;;;   Cmd + two-finger scroll   pan the active project sideways (with momentum)
+;;;   Ctrl+Opt+1…9              switch to project N
+;;;   Ctrl+Opt+Shift+1…9        send the focused window to project N
+;;;   Ctrl+Opt+Left/Right       pan by a step
+;;;   Ctrl+Opt+0                pan back to where the project started
+;;;   Ctrl+Opt+N                new project
+;;; Handled events are swallowed; everything else passes through untouched.
+;;; Mouse presses are only watched, to know which window the user is dragging.
+
+(import "coil.primitive" :as primitive)
+(import "wm.objc" :use [nil nil?])
+(import "wm.ax" :as ax)
+(import "wm.model" :as model)
+(import "wm.winlist" :as winlist)
+(import "wm.pan" :as pan)
+(import "wm.cocoa" :use [CGPoint CGRect])
+
+(extern CGEventTapCreate
+        :cc
+        c
+        [u32
+         u32
+         u32
+         u64
+         (fnptr c [(ptr i8) u32 (ptr i8) (ptr i8)] (ptr i8))
+         (ptr i8)]
+        (-> (ptr i8)))
+
+(extern CGEventTapEnable :cc c [(ptr i8) u8] (-> void))
+
+(extern CGEventGetLocation :cc c [(ptr i8)] (-> CGPoint))
+
+(extern CFMachPortCreateRunLoopSource
+        :cc
+        c
+        [(ptr i8) (ptr i8) i64]
+        (-> (ptr i8)))
+
+(extern CGEventGetFlags :cc c [(ptr i8)] (-> u64))
+
+(extern CGEventGetIntegerValueField :cc c [(ptr i8) u32] (-> i64))
+
+;; CGEventTapLocation / placement / options
+(const SESSION-TAP 1)
+
+(const HEAD-INSERT 0)
+
+(const TAP-DEFAULT 0)
+
+;; CGEventType
+(const LEFT-MOUSE-DOWN 1)
+
+(const LEFT-MOUSE-UP 2)
+
+(const KEY-DOWN 10)
+
+(const SCROLL-WHEEL 22)
+
+(const TAP-DISABLED-BY-TIMEOUT 4294967294)
+
+(const TAP-DISABLED-BY-USER 4294967295)
+
+;; CGEventFlags
+(const FLAG-SHIFT 131072)
+
+(const FLAG-CONTROL 262144)
+
+(const FLAG-OPTION 524288)
+
+(const FLAG-COMMAND 1048576)
+
+;; CGEventField
+(const FIELD-KEYCODE 9)
+
+(const FIELD-SCROLL-POINT-DELTA-1 96)
+
+(const FIELD-SCROLL-POINT-DELTA-2 97)
+
+(const FIELD-SCROLL-PHASE 99)
+
+(const FIELD-MOMENTUM-PHASE 123)
+
+;; CGScrollPhase / CGMomentumScrollPhase
+(const PHASE-BEGAN 1)
+
+(const MOMENTUM-END 3)
+
+;; virtual key codes
+(const KEY-0 29)
+
+(const KEY-N 45)
+
+(const KEY-LEFT 123)
+
+(const KEY-RIGHT 124)
+
+(const ARROW-PAN-STEP 240.0)
+
+(defstruct Input [(tap (ptr i8)) (panning bool) (pan-screen u32)])
+
+;;; The display under the mouse pointer.
+(defn screen-under [(event (ptr i8))] (-> u32)
+  (let [pt (CGEventGetLocation event)
+        i (model/screen-index-at (.x pt) (.y pt))]
+    (.id (model/screen-at (if (< i 0) 0 i)))))
+
+(defn input [] (-> (ptr Input))
+  (primitive/alloc-static Input))
+
+(defn has? [(flags u64) (bit i64)] (-> bool)
+  (!= (& flags (primitive/cast u64 bit)) (primitive/cast u64 0)))
+
+(defn event-field [(event (ptr i8)) (f i64)] (-> i64)
+  (CGEventGetIntegerValueField event (primitive/cast u32 f)))
+
+;;; Project number (1-based) for a digit key, or 0.
+(defn digit-of [(keycode i64)] (-> i64)
+  (case keycode
+    18 1
+    19 2
+    20 3
+    21 4
+    23 5
+    22 6
+    26 7
+    28 8
+    25 9
+    0))
+
+;;; Returns the event to pass it on, or null to swallow it.
+(defn on-scroll [(event (ptr i8))] (-> (ptr i8))
+  (let [flags (CGEventGetFlags event)
+        phase (event-field event FIELD-SCROLL-PHASE)
+        momentum (event-field event FIELD-MOMENTUM-PHASE)
+        dx (primitive/cast f64 (event-field event FIELD-SCROLL-POINT-DELTA-2))]
+    (cond ;; a gesture that started with Command keeps panning its screen through its momentum
+          (and (.panning (input)) (!= momentum 0))
+            (do
+              (pan/scroll! (.pan-screen (input)) dx)
+              (if (= momentum MOMENTUM-END) (set! (.panning (input)) false) 0)
+              (nil))
+          (has? flags FLAG-COMMAND)
+            (do
+              (if (or (not (.panning (input))) (= phase PHASE-BEGAN))
+                  (set! (.pan-screen (input)) (screen-under event))
+                  0)
+              (set! (.panning (input)) true)
+              (pan/scroll! (.pan-screen (input)) dx)
+              (nil))
+          :else
+            (do
+              (if (= phase PHASE-BEGAN) (set! (.panning (input)) false) 0)
+              event))))
+
+(defn send-focused-to! [(p i64)] (-> i64)
+  (let [focused (ax/copy-system-focused-window)]
+    (if (nil? focused)
+        0
+        (let [i (model/index-of-element focused)]
+          (do
+            (if (< i 0) 0 (model/send-window! i p))
+            (ax/release focused))))))
+
+(defn new-project! [] (-> i64)
+  (let [(mut buf) (zeroed (array i8 64))
+        name (model/untitled-name (primitive/cast (ptr i8) (mut buf)) 64)]
+    (model/switch! (model/add-project! name))))
+
+(defn on-key [(event (ptr i8))] (-> (ptr i8))
+  (let [flags (CGEventGetFlags event)
+        key (event-field event FIELD-KEYCODE)
+        digit (digit-of key)]
+    (if (or (not (has? flags FLAG-CONTROL))
+            (not (has? flags FLAG-OPTION))
+            (has? flags FLAG-COMMAND))
+        event
+        (cond (and (> digit 0) (has? flags FLAG-SHIFT))
+                (do (send-focused-to! (- digit 1)) (nil))
+              (> digit 0) (do (model/switch! (- digit 1)) (nil))
+              (= key KEY-LEFT)
+                (do (pan/step! (screen-under event) ARROW-PAN-STEP) (nil))
+              (= key KEY-RIGHT)
+                (do
+                  (pan/step! (screen-under event) (- 0.0 ARROW-PAN-STEP))
+                  (nil))
+              (= key KEY-0) (do (pan/reset! (screen-under event)) (nil))
+              (= key KEY-N) (do (new-project!) (nil))
+              :else event))))
+
+(defn on-event [(proxy (ptr i8)) (kind u32) (event (ptr i8)) (refcon (ptr i8))]
+  (-> (ptr i8))
+  (let [k (primitive/cast i64 kind)]
+    (cond (or (= k TAP-DISABLED-BY-TIMEOUT) (= k TAP-DISABLED-BY-USER))
+            (do
+              (if (pan/debug?)
+                  (do
+                    (println "[input] macOS disabled the event tap; input was lost")
+                    0)
+                  0)
+              (CGEventTapEnable (.tap (input)) (primitive/cast u8 1))
+              event)
+          (= k SCROLL-WHEEL) (on-scroll event)
+          (= k KEY-DOWN) (on-key event)
+          (= k LEFT-MOUSE-DOWN)
+            (do
+              (model/set-dragging! (winlist/window-at (CGEventGetLocation event)))
+              event)
+          (= k LEFT-MOUSE-UP)
+            (do (model/set-dragging! (primitive/cast u32 0)) event)
+          :else event)))
+
+;;; Install the tap; panics when macOS refuses it (no Accessibility permission).
+(defn start! [] (-> i64)
+  (let [mask
+          (| (<< (primitive/cast u64 1) (primitive/cast u64 KEY-DOWN))
+             (<< (primitive/cast u64 1) (primitive/cast u64 SCROLL-WHEEL))
+             (<< (primitive/cast u64 1) (primitive/cast u64 LEFT-MOUSE-DOWN))
+             (<< (primitive/cast u64 1) (primitive/cast u64 LEFT-MOUSE-UP)))
+        tap
+          (CGEventTapCreate (primitive/cast u32 SESSION-TAP)
+                            (primitive/cast u32 HEAD-INSERT)
+                            (primitive/cast u32 TAP-DEFAULT)
+                            mask
+                            (fnptr-of on-event)
+                            (nil))]
+    (if (nil? tap)
+        (panic "input: could not create the event tap (is Accessibility permission granted?)")
+        (let [source (CFMachPortCreateRunLoopSource (nil) tap 0)]
+          (do
+            (set! (.tap (input)) tap)
+            (set! (.panning (input)) false)
+            (ax/CFRunLoopAddSource (ax/CFRunLoopGetMain)
+                                   source
+                                   (ax/extern-object (primitive/linker-address kCFRunLoopCommonModes)))
+            (CGEventTapEnable tap (primitive/cast u8 1))
+            0)))))

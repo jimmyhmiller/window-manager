@@ -1,0 +1,16 @@
+(module wm.transform-test)
+(import "wm.objc" :use *)
+(import "wm.cocoa" :use *)
+
+(deftest rotation-round-trips-through-a-layer
+  (let [t (CATransform3DRotate (perspective 600.0) 0.34 0.0 1.0 0.0)
+        layer (new-layer)]
+    (do
+      (assert (< (.m34 t) -0.0001))
+      (assert (< (.m13 t) 0.0))
+      (msg void layer c"setSublayerTransform:" [CATransform3D] t)
+      (let [back (msg CATransform3D layer c"sublayerTransform" [])]
+        (do
+          (assert-eq (.m11 back) (.m11 t))
+          (assert-eq (.m13 back) (.m13 t))
+          (assert-eq (.m34 back) (.m34 t)))))))

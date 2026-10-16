@@ -1,0 +1,25 @@
+(module test-window)
+
+(import "coil.primitive" :as primitive)
+
+(extern objc_getClass :cc c [(ptr i8)] (-> (ptr i8)))
+(extern sel_registerName :cc c [(ptr i8)] (-> (ptr i8)))
+(extern objc_msgSend :cc c [(ptr i8) (ptr i8)] (-> (ptr i8)))
+
+(defstruct CGRect [(x f64) (y f64) (w f64) (h f64)])
+
+(defn main [] (-> i64)
+  (let [app (objc_msgSend (objc_getClass c"NSApplication") (sel_registerName c"sharedApplication"))
+        win0 (objc_msgSend (objc_getClass c"NSWindow") (sel_registerName c"alloc"))
+        ; titled|closable|resizable = 1|2|8, backing buffered = 2
+        win (primitive/call-ptr (primitive/cast (fnptr c [(ptr i8) (ptr i8) CGRect i64 i64 u8] (ptr i8)) (primitive/fnptr-of objc_msgSend))
+                                win0 (sel_registerName c"initWithContentRect:styleMask:backing:defer:")
+                                (CGRect :x 300.0 :y 300.0 :w 400.0 :h 300.0) 11 2 (primitive/cast u8 0))]
+    (do
+      ; setActivationPolicy: regular, but never activate (don't steal focus)
+      (primitive/call-ptr (primitive/cast (fnptr c [(ptr i8) (ptr i8) i64] u8) (primitive/fnptr-of objc_msgSend))
+                          app (sel_registerName c"setActivationPolicy:") 0)
+      (primitive/call-ptr (primitive/cast (fnptr c [(ptr i8) (ptr i8) (ptr i8)] (ptr i8)) (primitive/fnptr-of objc_msgSend))
+                          win (sel_registerName c"orderBack:") (primitive/cast (ptr i8) 0))
+      (objc_msgSend app (sel_registerName c"run"))
+      0)))

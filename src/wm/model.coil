@@ -1,0 +1,887 @@
+(module wm.model)
+
+;;; Projects and the windows that belong to them. Every screen is independent:
+;;; each project has its own sideways pan on each screen, a window belongs to
+;;; the screen it sits on, and panning never moves a window onto another
+;;; screen. Only the active project's windows are showing; every other window
+;;; waits just past a free edge of its own screen. Nothing moves a window
+;;; except a pan, a project switch, or the user. Everything here runs on the
+;;; main thread; window moves are handed to `wm.mover`.
+
+(import "coil.primitive" :as primitive)
+(import "coil.alloc" :use [malloc-allocator])
+(import "coil.arraylist" :use [ArrayList])
+(import "coil.str" :use [from-cstr])
+(import "wm.objc" :use *)
+(import "wm.cocoa" :use *)
+(import "wm.ax" :as ax)
+(import "wm.canvas" :as canvas)
+(import "wm.mover" :as mover)
+(import "wm.clock" :use [now-ms])
+(import "wm.list" :use [remove-swap! remove-at!])
+(import "wm.winlist" :as winlist)
+
+(extern strdup :cc c [(ptr i8)] (-> (ptr i8)))
+
+(extern free :cc c [(ptr i8)] (-> void))
+
+(extern snprintf :cc c [(ptr i8) i64 (ptr i8) ...] (-> i32))
+
+(extern strcmp :cc c [(ptr i8) (ptr i8)] (-> i32))
+
+(extern CGEventSourceButtonState :cc c [i32 u32] (-> u8))
+
+;; A move event this soon after we asked for a move is our own, unless it is
+;; the window the user is dragging.
+(const OWN-MOVE-WINDOW-MS 500)
+
+;; kCGEventSourceStateCombinedSessionState, kCGMouseButtonLeft
+(const EVENT-SOURCE-COMBINED 0)
+
+(const MOUSE-BUTTON-LEFT 0)
+
+;;; A display, in global top-left coordinates. `visible` leaves out the menu
+;;; bar and Dock.
+(defstruct Screen
+  [(id u32) (frame CGRect) (visible CGRect) (edges canvas/Edges)])
+
+(defstruct Win
+  [(id u32)
+   (pid i32)
+   (element (ptr i8))
+   (title (ptr i8))
+   (project i64)
+   (screen u32)
+   (canvas CGPoint)
+   (size CGSize)
+   (shown bool)
+   (minimized bool)
+   (target CGPoint)
+   (moved-ms i64)])
+
+(defstruct Project [(name (ptr i8)) (focus u32)])
+
+;;; How far project `project` is scrolled right on screen `screen`, in points.
+(defstruct Pan [(project i64) (screen u32) (x f64)])
+
+(defstruct Model
+  [(wins (ArrayList Win))
+   (projects (ArrayList Project))
+   (pans (ArrayList Pan))
+   (screens (ArrayList Screen))
+   (active i64)
+   (dragging u32)
+   (interacting bool)
+   (changed (fnptr c [] void))
+   (dirty bool)])
+
+(defn model [] (-> (ptr Model))
+  (primitive/alloc-static Model))
+
+(defn noop [] (-> void)
+  (forget 0))
+
+(defn init! [] (-> i64)
+  (do
+    (set! (.wins (model)) (ArrayList::new [Win] (malloc-allocator)))
+    (set! (.projects (model)) (ArrayList::new [Project] (malloc-allocator)))
+    (set! (.pans (model)) (ArrayList::new [Pan] (malloc-allocator)))
+    (set! (.screens (model)) (ArrayList::new [Screen] (malloc-allocator)))
+    (set! (.active (model)) 0)
+    (set! (.dragging (model)) (primitive/cast u32 0))
+    (set! (.changed (model)) (fnptr-of noop))
+    (update-geometry!)))
+
+;;; True while a pan is live; background work that could steal the main thread
+;;; (window rescans) waits until it ends.
+(defn interacting? [] (-> bool)
+  (.interacting (model)))
+
+(defn set-interacting! [(on bool)] (-> i64)
+  (do (set! (.interacting (model)) on) 0))
+
+;;; Called whenever projects, membership, or the active project change.
+(defn on-change! [(f (fnptr c [] void))] (-> i64)
+  (do (set! (.changed (model)) f) 0))
+
+(defn changed! [] (-> i64)
+  (do
+    (set! (.dirty (model)) true)
+    (call-ptr (.changed (model)))
+    0))
+
+;; ---- screens ----
+
+(defn screen-count [] (-> i64)
+  (len (.screens (model))))
+
+(defn screen-at [(i i64)] (-> Screen)
+  (get (.screens (model)) i))
+
+(defn display-id [(ns-screen (ptr i8))] (-> u32)
+  (msg u32
+       (msg (ptr i8)
+            (send ns-screen c"deviceDescription")
+            c"objectForKey:"
+            [(ptr i8)]
+            (nsstr c"NSScreenNumber"))
+       c"unsignedIntValue"
+       []))
+
+;;; Re-read every display: frames (top-left coordinates; AppKit's grow up from
+;;; the primary screen's bottom-left), visible areas, and which edges border
+;;; another display.
+(defn update-geometry! [] (-> i64)
+  (let [ns-screens (send (cls c"NSScreen") c"screens")
+        n (msg i64 ns-screens c"count" [])
+        primary-h (.h (msg CGRect (main-screen) c"frame" []))
+        (mut frames) (ArrayList::new [CGRect] (malloc-allocator))
+        (mut i) 0]
+    (do
+      (clear! (mut (.screens (model))))
+      (while (< i n)
+        (let [s
+                (msg (ptr i8)
+                     ns-screens
+                     c"objectAtIndex:"
+                     [u64]
+                     (primitive/cast u64 (load i)))
+              f (msg CGRect s c"frame" [])]
+          (do
+            (push! (mut frames)
+                   (rect (.x f) (- primary-h (+ (.y f) (.h f))) (.w f) (.h f)))
+            (set! i (+ i 1)))))
+      (set! i 0)
+      (while (< i n)
+        (let [s
+                (msg (ptr i8)
+                     ns-screens
+                     c"objectAtIndex:"
+                     [u64]
+                     (primitive/cast u64 (load i)))
+              frame (get frames i)
+              (mut others) (ArrayList::new [CGRect] (malloc-allocator))
+              (mut j) 0
+              v (visible-frame s)]
+          (do
+            (while (< j n)
+              (do
+                (if (= j i) 0 (push! (mut others) (get frames j)))
+                (set! j (+ j 1))))
+            (let [edges (canvas/edges-of frame (slice others))]
+              (do
+                (if (and (.left-blocked edges) (.right-blocked edges))
+                    (panic "wm: a screen has displays on both its left and right, leaving no free edge to hide windows at; arrange the displays so each has a free left or right side")
+                    0)
+                (push! (mut (.screens (model)))
+                       (Screen
+                         :id (display-id s)
+                         :frame frame
+                         :visible
+                           (rect (.x v)
+                                 (- primary-h (+ (.y v) (.h v)))
+                                 (.w v)
+                                 (.h v))
+                         :edges edges))))
+            (free! (mut others))
+            (set! i (+ i 1)))))
+      (free! (mut frames))
+      (println "[wm] {d} screen(s)" (screen-count))
+      0)))
+
+(defn screen-index [(id u32)] (-> i64)
+  (let [(mut i) 0
+        (mut found) -1]
+    (do
+      (while (and (< i (screen-count)) (< found 0))
+        (do
+          (if (= (.id (screen-at i)) id) (set! found i) 0)
+          (set! i (+ i 1))))
+      found)))
+
+(defn contains? [(r CGRect) (x f64) (y f64)] (-> bool)
+  (and (>= x (.x r))
+       (< x (+ (.x r) (.w r)))
+       (>= y (.y r))
+       (< y (+ (.y r) (.h r)))))
+
+;;; The screen holding point (x, y), or -1.
+(defn screen-index-at [(x f64) (y f64)] (-> i64)
+  (let [(mut i) 0
+        (mut found) -1]
+    (do
+      (while (and (< i (screen-count)) (< found 0))
+        (do
+          (if (contains? (.frame (screen-at i)) x y) (set! found i) 0)
+          (set! i (+ i 1))))
+      found)))
+
+;;; The screen a window at `pos` belongs to: the one holding its center, or the
+;;; one it waits at as an edge sliver. -1 when it is on no screen.
+(defn screen-index-of [(pos CGPoint) (size CGSize)] (-> i64)
+  (let [by-center
+          (screen-index-at (+ (.x pos) (/ (.w size) 2.0))
+                           (+ (.y pos) (/ (.h size) 2.0)))
+        (mut i) 0
+        (mut found) by-center]
+    (do
+      (while (and (< i (screen-count)) (< found 0))
+        (let [s (screen-at i)]
+          (do
+            (if (and (canvas/stashed-x? (.frame s) (.edges s) size pos)
+                     (>= (.y pos) (.y (.frame s)))
+                     (< (.y pos) (+ (.y (.frame s)) (.h (.frame s)))))
+                (set! found i)
+                0)
+            (set! i (+ i 1)))))
+      found)))
+
+(defn on-a-screen? [(pos CGPoint) (size CGSize)] (-> bool)
+  (>= (screen-index-of pos size) 0))
+
+;; ---- projects and pans ----
+
+(defn project-count [] (-> i64)
+  (len (.projects (model))))
+
+(defn project [(p i64)] (-> Project)
+  (get (.projects (model)) p))
+
+(defn project-name [(p i64)] (-> (ptr i8))
+  (.name (project p)))
+
+(defn active [] (-> i64)
+  (.active (model)))
+
+(defn put-project! [(p i64) (v Project)] (-> i64)
+  (set! (mut (.projects (model))) p v))
+
+(defn pan-index [(p i64) (screen u32)] (-> i64)
+  (let [(mut i) 0
+        (mut found) -1]
+    (do
+      (while (and (< i (len (.pans (model)))) (< found 0))
+        (let [e (get (.pans (model)) i)]
+          (do
+            (if (and (= (.project e) p) (= (.screen e) screen))
+                (set! found i)
+                0)
+            (set! i (+ i 1)))))
+      found)))
+
+;;; Project `p`'s pan on screen `screen` (0 until it is first panned).
+(defn pan-of [(p i64) (screen u32)] (-> f64)
+  (let [i (pan-index p screen)]
+    (if (< i 0) 0.0 (.x (get (.pans (model)) i)))))
+
+(defn set-pan! [(p i64) (screen u32) (x f64)] (-> i64)
+  (let [i (pan-index p screen)]
+    (do
+      (if (< i 0)
+          (push! (mut (.pans (model)))
+                 (Pan
+                   :project p
+                   :screen screen
+                   :x x))
+          (set! (mut (.pans (model)))
+                i
+                (Pan
+                  :project p
+                  :screen screen
+                  :x x)))
+      (set! (.dirty (model)) true)
+      0)))
+
+(defn pan-count [] (-> i64)
+  (len (.pans (model))))
+
+(defn pan-entry [(i i64)] (-> Pan)
+  (get (.pans (model)) i))
+
+(defn add-project! [(name (ptr i8))] (-> i64)
+  (do
+    (push! (mut (.projects (model)))
+           (Project :name (strdup name) :focus (primitive/cast u32 0)))
+    (changed!)
+    (- (project-count) 1)))
+
+(defn rename-project! [(p i64) (name (ptr i8))] (-> i64)
+  (let [old (project p)]
+    (do
+      (free (.name old))
+      (put-project! p (Project :name (strdup name) :focus (.focus old)))
+      (changed!))))
+
+;;; A fresh name, "Untitled", "Untitled 2", … not used by any project.
+(defn untitled-name [(buf (ptr i8)) (cap i64)] (-> (ptr i8))
+  (let [(mut n) 1]
+    (do
+      (loop (do
+              (if (= n 1)
+                  (snprintf buf cap c"Untitled")
+                  (snprintf buf cap c"Untitled %lld" (load n)))
+              (if (name-taken? buf) (set! n (+ n 1)) (break 0))))
+      buf)))
+
+(defn name-taken? [(name (ptr i8))] (-> bool)
+  (let [(mut p) 0
+        (mut taken) false]
+    (do
+      (while (< p (project-count))
+        (do
+          (if (= (strcmp (project-name p) name) (primitive/cast i32 0))
+              (set! taken true)
+              0)
+          (set! p (+ p 1))))
+      taken)))
+
+;;; Delete project `p`; its windows join the first remaining project and keep
+;;; their places on screen. The last project cannot be deleted.
+(defn delete-project! [(p i64)] (-> i64)
+  (if (<= (project-count) 1)
+      0
+      (let [heir (if (= p 0) 1 0)
+            (mut i) 0]
+        (do
+          (while (< i (win-count))
+            (let [w (win i)]
+              (do
+                (if (= (.project w) p) (move-to-project! i heir) 0)
+                (set! i (+ i 1)))))
+          ;; project indices above p shift down by one
+          (set! i 0)
+          (while (< i (win-count))
+            (let [w (win i)]
+              (do
+                (if (> (.project w) p)
+                    (put-win! i (with-project w (- (.project w) 1)))
+                    0)
+                (set! i (+ i 1)))))
+          (set! i 0)
+          (while (< i (pan-count))
+            (let [e (pan-entry i)]
+              (cond (= (.project e) p) (remove-swap! (mut (.pans (model))) i)
+                    (> (.project e) p)
+                      (do
+                        (set! (mut (.pans (model)))
+                              i
+                              (Pan
+                                :project (- (.project e) 1)
+                                :screen (.screen e)
+                                :x (.x e)))
+                        (set! i (+ i 1)))
+                    :else (set! i (+ i 1)))))
+          (free (project-name p))
+          (remove-at! (mut (.projects (model))) p)
+          (let [a (active)]
+            (set! (.active (model))
+                  (cond (= a p) (if (= heir 0) 0 (- heir 1))
+                        (> a p) (- a 1)
+                        :else a)))
+          (layout-all!)
+          (changed!)))))
+
+;; ---- windows ----
+
+(defn win-count [] (-> i64)
+  (len (.wins (model))))
+
+(defn win [(i i64)] (-> Win)
+  (get (.wins (model)) i))
+
+(defn put-win! [(i i64) (w Win)] (-> i64)
+  (set! (mut (.wins (model))) i w))
+
+(defn with-project [(w Win) (p i64)] (-> Win)
+  (Win
+    :id (.id w)
+    :pid (.pid w)
+    :element (.element w)
+    :title (.title w)
+    :project p
+    :screen (.screen w)
+    :canvas (.canvas w)
+    :size (.size w)
+    :shown (.shown w)
+    :minimized (.minimized w)
+    :target (.target w)
+    :moved-ms (.moved-ms w)))
+
+(defn with-place [(w Win) (screen u32) (c CGPoint)] (-> Win)
+  (Win
+    :id (.id w)
+    :pid (.pid w)
+    :element (.element w)
+    :title (.title w)
+    :project (.project w)
+    :screen screen
+    :canvas c
+    :size (.size w)
+    :shown (.shown w)
+    :minimized (.minimized w)
+    :target (.target w)
+    :moved-ms (.moved-ms w)))
+
+(defn with-size [(w Win) (s CGSize)] (-> Win)
+  (Win
+    :id (.id w)
+    :pid (.pid w)
+    :element (.element w)
+    :title (.title w)
+    :project (.project w)
+    :screen (.screen w)
+    :canvas (.canvas w)
+    :size s
+    :shown (.shown w)
+    :minimized (.minimized w)
+    :target (.target w)
+    :moved-ms (.moved-ms w)))
+
+(defn with-minimized [(w Win) (m bool)] (-> Win)
+  (Win
+    :id (.id w)
+    :pid (.pid w)
+    :element (.element w)
+    :title (.title w)
+    :project (.project w)
+    :screen (.screen w)
+    :canvas (.canvas w)
+    :size (.size w)
+    :shown (.shown w)
+    :minimized m
+    :target (.target w)
+    :moved-ms (.moved-ms w)))
+
+(defn with-move [(w Win) (shown bool) (target CGPoint) (ms i64)] (-> Win)
+  (Win
+    :id (.id w)
+    :pid (.pid w)
+    :element (.element w)
+    :title (.title w)
+    :project (.project w)
+    :screen (.screen w)
+    :canvas (.canvas w)
+    :size (.size w)
+    :shown shown
+    :minimized (.minimized w)
+    :target target
+    :moved-ms ms))
+
+(defn index-of-id [(id u32)] (-> i64)
+  (let [(mut i) 0
+        (mut found) -1]
+    (do
+      (while (and (< i (win-count)) (< found 0))
+        (do
+          (if (= (.id (win i)) id) (set! found i) 0)
+          (set! i (+ i 1))))
+      found)))
+
+;;; The tracked window equal to an AX element (CFEqual), or -1.
+(defn index-of-element [(el (ptr i8))] (-> i64)
+  (let [(mut i) 0
+        (mut found) -1]
+    (do
+      (while (and (< i (win-count)) (< found 0))
+        (do
+          (if (ax/same? (.element (win i)) el) (set! found i) 0)
+          (set! i (+ i 1))))
+      found)))
+
+;;; The project a CGWindowID belongs to, or -1 when it is not tracked.
+(defn project-of-window-id [(id u32)] (-> i64)
+  (let [i (index-of-id id)]
+    (if (< i 0) -1 (.project (win i)))))
+
+;;; Where a window now at `pos` lives in project `p`: its screen and its
+;;; canvas position under that screen's pan.
+(defn place-here [(p i64) (pos CGPoint) (size CGSize)] (-> Win)
+  (let [si (screen-index-of pos size)
+        screen (if (< si 0) (.id (screen-at 0)) (.id (screen-at si)))]
+    (Win
+      :id (primitive/cast u32 0)
+      :pid (primitive/cast i32 0)
+      :element (nil)
+      :title (nil)
+      :project p
+      :screen screen
+      :canvas (canvas/canvas-pos (pan-of p screen) pos)
+      :size size
+      :shown true
+      :minimized false
+      :target pos
+      :moved-ms 0)))
+
+;;; Window `i`'s title changed to `title` (copied).
+(defn set-title! [(i i64) (title (ptr i8))] (-> i64)
+  (let [w (win i)]
+    (do
+      (free (.title w))
+      (put-win! i
+                (Win
+                  :id (.id w)
+                  :pid (.pid w)
+                  :element (.element w)
+                  :title (strdup title)
+                  :project (.project w)
+                  :screen (.screen w)
+                  :canvas (.canvas w)
+                  :size (.size w)
+                  :shown (.shown w)
+                  :minimized (.minimized w)
+                  :target (.target w)
+                  :moved-ms (.moved-ms w)))
+      (set! (.dirty (model)) true)
+      0)))
+
+;;; Start tracking a window (the element is retained, the title copied) in
+;;; project `p` on `screen` at canvas position `c`, and put it where it belongs.
+(defn add-window! [(id u32)
+                   (pid i32)
+                   (el (ptr i8))
+                   (title (ptr i8))
+                   (p i64)
+                   (screen u32)
+                   (c CGPoint)
+                   (size CGSize)]
+  (-> i64)
+  (do
+    (push! (mut (.wins (model)))
+           (Win
+             :id id
+             :pid pid
+             :element (ax/retain el)
+             :title (strdup title)
+             :project p
+             :screen screen
+             :canvas c
+             :size size
+             :shown true
+             :minimized false
+             :target (CGPoint :x 0.0 :y 0.0)
+             :moved-ms 0))
+    (layout-window! (- (win-count) 1))
+    (changed!)))
+
+(defn remove-window! [(i i64)] (-> i64)
+  (let [w (win i)]
+    (do
+      (mover/forget-window! (.pid w) (.element w))
+      (ax/release (.element w))
+      (free (.title w))
+      (remove-swap! (mut (.wins (model))) i)
+      (changed!))))
+
+;;; Forget every window of a quit app.
+(defn remove-app! [(pid i32)] (-> i64)
+  (let [(mut i) 0]
+    (do
+      (while (< i (win-count))
+        (if (= (.pid (win i)) pid)
+            (remove-window! i)
+            (set! i (+ i 1))))
+      (mover/stop-app! pid))))
+
+;; ---- layout ----
+
+(defn mouse-down? [] (-> bool)
+  (!= (CGEventSourceButtonState (primitive/cast i32 EVENT-SOURCE-COMBINED)
+                                (primitive/cast u32 MOUSE-BUTTON-LEFT))
+      (primitive/cast u8 0)))
+
+;;; Whether a move report for `w` at `pos` is one of ours: it is exactly where
+;;; we last asked it to go, or our moves are still on their way (a slow app
+;;; reports old positions late — taking those for the user's would store an
+;;; in-between position and make the window jump later).
+(defn our-move? [(w Win) (pos CGPoint)] (-> bool)
+  (or (and (<= (abs-f (- (.x pos) (.x (.target w)))) 1.0)
+           (<= (abs-f (- (.y pos) (.y (.target w)))) 1.0))
+      (mover/window-busy? (.pid w) (.element w))
+      (< (- (now-ms) (.moved-ms w)) OWN-MOVE-WINDOW-MS)))
+
+(defn abs-f [(x f64)] (-> f64)
+  (if (< x 0.0) (- 0.0 x) x))
+
+;;; Make the model agree with where the active project's showing windows on
+;;; `screen` really are, from the window server's own list (no app round
+;;; trips). A window still being moved is left alone. Returns how many
+;;; windows were corrected.
+(defn resync-screen! [(screen u32) (frames (ArrayList winlist/Frame))] (-> i64)
+  (let [(mut i) 0
+        (mut fixed) 0]
+    (do
+      (while (< i (win-count))
+        (let [w (win i)]
+          (do
+            (if (and (= (.project w) (active))
+                     (= (.screen w) screen)
+                     (.shown w)
+                     (not (.minimized w))
+                     (not (mover/window-busy? (.pid w) (.element w))))
+                (match (winlist/frame-of frames (.id w))
+                  (None [] 0)
+                  (Some [f]
+                        (if (and (<= (abs-f (- (.x f) (.x (.target w)))) 1.0)
+                                 (<= (abs-f (- (.y f) (.y (.target w)))) 1.0)
+                                 (<= (abs-f (- (.w f) (.w (.size w)))) 1.0)
+                                 (<= (abs-f (- (.h f) (.h (.size w)))) 1.0))
+                            0
+                            (let [pos (CGPoint :x (.x f) :y (.y f))]
+                              (do
+                                (put-win! i
+                                          (with-move (with-size (with-place w
+                                                                            screen
+                                                                            (canvas/canvas-pos (pan-of (.project w)
+                                                                                                       screen)
+                                                                                               pos))
+                                                                (CGSize
+                                                                  :w (.w f)
+                                                                  :h (.h f)))
+                                                     true
+                                                     pos
+                                                     (.moved-ms w)))
+                                (set! fixed (+ fixed 1))
+                                0)))))
+                0)
+            (set! i (+ i 1)))))
+      (load fixed))))
+
+;;; True while the user is dragging window `w`; it stays under the cursor
+;;; rather than following a pan.
+(defn being-dragged? [(w Win)] (-> bool)
+  (and (= (.id w) (.dragging (model))) (mouse-down?)))
+
+(defn request-move! [(i i64) (x f64) (y f64) (shown bool)] (-> i64)
+  (let [w (win i)]
+    (do
+      (put-win! i (with-move w shown (CGPoint :x x :y y) (now-ms)))
+      (mover/request! (.pid w) (.element w) x y))))
+
+;;; The screen a window belongs to; a window whose screen went away (a display
+;;; was unplugged) moves to the primary screen.
+(defn screen-of-win [(i i64)] (-> Screen)
+  (let [w (win i)
+        si (screen-index (.screen w))]
+    (if (>= si 0)
+        (screen-at si)
+        (let [primary (screen-at 0)]
+          (do
+            (put-win! i (with-place w (.id primary) (.canvas w)))
+            primary)))))
+
+;;; Where window `i` belongs for its project's pan on its screen.
+(defn target-of [(i i64)] (-> canvas/Placement)
+  (let [s (screen-of-win i)
+        w (win i)]
+    (if (= (.project w) (active))
+        (canvas/place (.frame s)
+                      (.edges s)
+                      (pan-of (.project w) (.screen w))
+                      (.canvas w)
+                      (.size w))
+        (let [hidden
+                (canvas/hidden-pos (.frame s)
+                                   (.edges s)
+                                   (.size w)
+                                   (.y (.canvas w)))]
+          (canvas/Stash (.x hidden) (.y hidden))))))
+
+;;; Put window `i` where its project and pan say it belongs.
+(defn layout-window! [(i i64)] (-> i64)
+  (let [w (win i)]
+    (if (or (.minimized w) (being-dragged? w))
+        0
+        (match (target-of i)
+          (Show [x y] (request-move! i x y true))
+          (Stash [x y] (request-move! i x y false))))))
+
+(defn layout-all! [] (-> i64)
+  (let [(mut i) 0]
+    (do
+      (while (< i (win-count))
+        (do (layout-window! i) (set! i (+ i 1))))
+      0)))
+
+;;; Lay out the active project's windows on one screen.
+(defn layout-screen! [(screen u32)] (-> i64)
+  (let [(mut i) 0]
+    (do
+      (while (< i (win-count))
+        (let [w (win i)]
+          (do
+            (if (and (= (.project w) (active)) (= (.screen w) screen))
+                (layout-window! i)
+                0)
+            (set! i (+ i 1)))))
+      0)))
+
+;; ---- user actions ----
+
+;;; Bring window `i` to the front and give its app keyboard focus. This goes
+;;; through Accessibility: cooperative activation refuses
+;;; `NSRunningApplication activate` from a background app like this one.
+(defn focus-window! [(i i64)] (-> i64)
+  (let [w (win i)
+        app (ax/copy-app (.pid w))]
+    (do
+      (ax/raise! (.element w))
+      (ax/set-bool-attr! (.element w) c"AXMain" true)
+      (ax/set-bool-attr! app c"AXFrontmost" true)
+      (ax/release app))))
+
+;;; Make project `p` active: hide the old project's windows, lay out the new
+;;; one's, and focus the window that was last focused there.
+(defn switch! [(p i64)] (-> i64)
+  (if (or (< p 0) (>= p (project-count)) (= p (active)))
+      0
+      (do
+        (set! (.active (model)) p)
+        (layout-all!)
+        (refocus!)
+        (println "[wm] project: {s}" (from-cstr (project-name p)))
+        (changed!))))
+
+;;; Give keyboard focus back to the active project: the window last focused
+;;; there, or any of its windows.
+(defn refocus! [] (-> i64)
+  (let [p (active)
+        focus (index-of-id (.focus (project p)))]
+    (if (< focus 0)
+        (first-window-focus! p)
+        (focus-window! focus))))
+
+;;; Focus any window of project `p`; with none, keyboard focus goes to this
+;;; (windowless) app so it does not stay in a hidden window.
+(defn first-window-focus! [(p i64)] (-> i64)
+  (let [(mut i) 0
+        (mut found) -1]
+    (do
+      (while (and (< i (win-count)) (< found 0))
+        (do
+          (if (and (= (.project (win i)) p) (not (.minimized (win i))))
+              (set! found i)
+              0)
+          (set! i (+ i 1))))
+      (if (< found 0)
+          (activate-self!)
+          (focus-window! found)))))
+
+;;; Pan the active project on `screen` sideways so its windows move by `dx`.
+(defn pan-by! [(screen u32) (dx f64)] (-> i64)
+  (do
+    (set-pan! (active) screen (- (pan-of (active) screen) dx))
+    (layout-screen! screen)))
+
+;;; Pan the active project back to where it started on `screen`.
+(defn reset-pan! [(screen u32)] (-> i64)
+  (do
+    (set-pan! (active) screen 0.0)
+    (layout-screen! screen)))
+
+;;; The user pressed the mouse on window `id` (0 for none): until release, that
+;;; window is theirs to drag and a pan leaves it alone.
+(defn set-dragging! [(id u32)] (-> i64)
+  (do (set! (.dragging (model)) id) 0))
+
+;;; A window moved. If the user moved it, remember where it went — on whichever
+;;; screen it now sits; if it is one of our own moves, ignore it.
+(defn window-moved! [(i i64)] (-> i64)
+  (let [w (win i)]
+    (if (.minimized w)
+        0
+        (match (ax/position (.element w))
+          (None [] 0)
+          (Some [pos]
+                (cond (and (not (being-dragged? w)) (our-move? w pos)) 0
+                      ;; something else moved a hidden project's window; put it back
+                      (!= (.project w) (active)) (layout-window! i)
+                      ;; a window waiting off screen is only ever where we put it
+                      (and (not (.shown w)) (not (being-dragged? w))) 0
+                      :else
+                        (let [si (screen-index-of pos (.size w))]
+                          (if (< si 0)
+                              0
+                              (let [s (.id (screen-at si))]
+                                (do
+                                  (put-win! i
+                                            (with-place w
+                                                        s
+                                                        (canvas/canvas-pos (pan-of (.project w)
+                                                                                   s)
+                                                                           pos)))
+                                  (set! (.dirty (model)) true)
+                                  0))))))))))
+
+(defn window-resized! [(i i64)] (-> i64)
+  (match (ax/size (.element (win i)))
+    (None [] 0)
+    (Some [s] (do (put-win! i (with-size (win i) s)) (window-moved! i)))))
+
+(defn window-minimized! [(i i64) (minimized bool)] (-> i64)
+  (do
+    (put-win! i (with-minimized (win i) minimized))
+    (if minimized 0 (layout-window! i))
+    (changed!)))
+
+;;; A window got keyboard focus: its project becomes active.
+(defn window-focused! [(i i64)] (-> i64)
+  (let [w (win i)
+        p (.project w)]
+    (do
+      (put-project! p (Project :name (.name (project p)) :focus (.id w)))
+      (if (= p (active))
+          0
+          (do
+            (set! (.active (model)) p)
+            (layout-all!)
+            (println "[wm] project (focus): {s}" (from-cstr (project-name p)))
+            (changed!))))))
+
+;;; Window `i` joins project `p`, keeping its place on screen.
+(defn move-to-project! [(i i64) (p i64)] (-> i64)
+  (let [w (win i)
+        here
+          (CGPoint
+            :x (- (.x (.canvas w)) (pan-of (.project w) (.screen w)))
+            :y (.y (.canvas w)))]
+    (put-win! i
+              (with-place (with-project w p)
+                          (.screen w)
+                          (canvas/canvas-pos (pan-of p (.screen w)) here)))))
+
+;;; Send window `i` to project `p`; it shows up right where it is when `p` is
+;;; next opened.
+(defn send-window! [(i i64) (p i64)] (-> i64)
+  (if (or (< p 0) (>= p (project-count)) (= p (.project (win i))))
+      0
+      (do
+        (move-to-project! i p)
+        (layout-window! i)
+        (changed!))))
+
+;;; Put every window back in plain view, synchronously, before quitting: a
+;;; window that is off screen comes back where its pan puts it, pulled inside
+;;; its own screen's visible area.
+(defn restore-all! [] (-> i64)
+  (let [(mut i) 0]
+    (do
+      (while (< i (win-count))
+        (let [w (win i)]
+          (do
+            (if (or (.minimized w) (and (.shown w) (= (.project w) (active))))
+                0
+                (let [st (.visible (screen-of-win i))
+                      x (- (.x (.canvas w)) (pan-of (.project w) (.screen w)))
+                      cx
+                        (canvas/clamp x
+                                      (.x st)
+                                      (- (+ (.x st) (.w st))
+                                         (canvas/min-f (.w (.size w)) (.w st))))
+                      cy
+                        (canvas/clamp (.y (.canvas w))
+                                      (.y st)
+                                      (- (+ (.y st) (.h st))
+                                         (canvas/min-f (.h (.size w)) (.h st))))]
+                  (do (ax/set-position! (.element w) cx cy) 0)))
+            (set! i (+ i 1)))))
+      0)))

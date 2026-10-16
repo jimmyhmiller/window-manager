@@ -1,0 +1,302 @@
+(module wm.ax)
+
+;;; Accessibility API wrappers: reading and moving other apps' windows, and
+;;; observing their window events. Elements are CoreFoundation objects
+;;; (`(ptr i8)`); functions named `copy-…` return a +1 reference the caller
+;;; releases with `release`.
+
+(import "coil.primitive" :as primitive)
+(import "wm.objc" :use [nil nil? cls msg send])
+(import "wm.cocoa" :use [CGPoint CGSize nsstr])
+
+(extern CFRetain :cc c [(ptr i8)] (-> (ptr i8)))
+
+(extern CFRelease :cc c [(ptr i8)] (-> void))
+
+(extern CFEqual :cc c [(ptr i8) (ptr i8)] (-> u8))
+
+(extern CFArrayGetCount :cc c [(ptr i8)] (-> i64))
+
+(extern CFArrayGetValueAtIndex :cc c [(ptr i8) i64] (-> (ptr i8)))
+
+(extern CFBooleanGetValue :cc c [(ptr i8)] (-> u8))
+
+(extern CFRunLoopGetMain :cc c [] (-> (ptr i8)))
+
+(extern CFRunLoopAddSource :cc c [(ptr i8) (ptr i8) (ptr i8)] (-> void))
+
+(extern AXIsProcessTrusted :cc c [] (-> u8))
+
+(extern AXUIElementCreateApplication :cc c [i32] (-> (ptr i8)))
+
+(extern AXUIElementCopyAttributeValue
+        :cc
+        c
+        [(ptr i8) (ptr i8) (ptr (ptr i8))]
+        (-> i32))
+
+(extern AXUIElementSetAttributeValue
+        :cc
+        c
+        [(ptr i8) (ptr i8) (ptr i8)]
+        (-> i32))
+
+(extern AXUIElementPerformAction :cc c [(ptr i8) (ptr i8)] (-> i32))
+
+(extern AXUIElementGetPid :cc c [(ptr i8) (ptr i32)] (-> i32))
+
+(extern AXUIElementSetMessagingTimeout :cc c [(ptr i8) f32] (-> i32))
+
+(extern AXValueCreate :cc c [i32 (ptr i8)] (-> (ptr i8)))
+
+(extern AXValueGetValue :cc c [(ptr i8) i32 (ptr i8)] (-> u8))
+
+(extern AXObserverCreate
+        :cc
+        c
+        [i32
+         (fnptr c [(ptr i8) (ptr i8) (ptr i8) (ptr i8)] void)
+         (ptr (ptr i8))]
+        (-> i32))
+
+(extern AXObserverAddNotification
+        :cc
+        c
+        [(ptr i8) (ptr i8) (ptr i8) (ptr i8)]
+        (-> i32))
+
+(extern AXObserverRemoveNotification
+        :cc
+        c
+        [(ptr i8) (ptr i8) (ptr i8)]
+        (-> i32))
+
+(extern AXObserverGetRunLoopSource :cc c [(ptr i8)] (-> (ptr i8)))
+
+;; Private but stable, used by every macOS window manager: the CGWindowID behind
+;; an AX window element.
+(extern _AXUIElementGetWindow :cc c [(ptr i8) (ptr u32)] (-> i32))
+
+;; AXValueType
+(const VALUE-CG-POINT 1)
+
+(const VALUE-CG-SIZE 2)
+
+;; Seconds an AX call may wait on an unresponsive app before failing.
+(const MESSAGING-TIMEOUT 1.0)
+
+;; Attribute names used on every move, created once (`init!`) so the mover
+;; threads never allocate or autorelease a string per move.
+(defstruct Keys [(position (ptr i8)) (enhanced-ui (ptr i8))])
+
+(defn keys [] (-> (ptr Keys))
+  (primitive/alloc-static Keys))
+
+(extern CFStringCreateWithCString :cc c [(ptr i8) (ptr i8) u32] (-> (ptr i8)))
+
+;; kCFStringEncodingUTF8
+(const UTF8 134217984)
+
+(defn make-key [(name (ptr i8))] (-> (ptr i8))
+  (CFStringCreateWithCString (nil) name (primitive/cast u32 UTF8)))
+
+;;; Call once on the main thread before any window moves.
+(defn init! [] (-> i64)
+  (do
+    (set! (.position (keys)) (make-key c"AXPosition"))
+    (set! (.enhanced-ui (keys)) (make-key c"AXEnhancedUserInterface"))
+    0))
+
+;;; The object stored in a framework's exported `const CFTypeRef` global.
+(defn extern-object [(address (ptr u8))] (-> (ptr i8))
+  (primitive/load (primitive/cast (ptr (ptr i8)) address)))
+
+(defn release [(cf (ptr i8))] (-> i64)
+  (if (nil? cf) 0 (do (CFRelease cf) 0)))
+
+(defn retain [(cf (ptr i8))] (-> (ptr i8))
+  (CFRetain cf))
+
+(defn same? [(a (ptr i8)) (b (ptr i8))] (-> bool)
+  (!= (CFEqual a b) (primitive/cast u8 0)))
+
+(defn trusted? [] (-> bool)
+  (!= (AXIsProcessTrusted) (primitive/cast u8 0)))
+
+;;; The application element for `pid`, with a bounded messaging timeout. +1.
+(defn copy-app [(pid i32)] (-> (ptr i8))
+  (let [app (AXUIElementCreateApplication pid)]
+    (do
+      (AXUIElementSetMessagingTimeout app
+                                      (primitive/cast f32 MESSAGING-TIMEOUT))
+      app)))
+
+;;; An attribute's value, +1, or null when the element has none or errored.
+(defn copy-attr [(el (ptr i8)) (attr (ptr i8))] (-> (ptr i8))
+  (let [(mut out) (nil)]
+    (if (= (AXUIElementCopyAttributeValue el (nsstr attr) (mut out))
+           (primitive/cast i32 0))
+        out
+        (nil))))
+
+(defn bool-attr [(el (ptr i8)) (attr (ptr i8))] (-> bool)
+  (let [v (copy-attr el attr)]
+    (if (nil? v)
+        false
+        (let [b (!= (CFBooleanGetValue v) (primitive/cast u8 0))]
+          (do (release v) b)))))
+
+(defn set-bool-attr! [(el (ptr i8)) (attr (ptr i8)) (value bool)] (-> i32)
+  (AXUIElementSetAttributeValue el
+                                (nsstr attr)
+                                (if value
+                                    (extern-object (primitive/linker-address kCFBooleanTrue))
+                                    (extern-object (primitive/linker-address kCFBooleanFalse)))))
+
+;;; True when the string attribute equals `expected`.
+(defn string-attr-is? [(el (ptr i8)) (attr (ptr i8)) (expected (ptr i8))]
+  (-> bool)
+  (let [v (copy-attr el attr)]
+    (if (nil? v)
+        false
+        (let [same (same? v (nsstr expected))]
+          (do (release v) same)))))
+
+(defn position [(el (ptr i8))] (-> (Option CGPoint))
+  (let [v (copy-attr el c"AXPosition")
+        (mut p) (CGPoint :x 0.0 :y 0.0)]
+    (if (nil? v)
+        (None)
+        (do
+          (AXValueGetValue v
+                           (primitive/cast i32 VALUE-CG-POINT)
+                           (primitive/cast (ptr i8) (mut p)))
+          (release v)
+          (Some p)))))
+
+(defn size [(el (ptr i8))] (-> (Option CGSize))
+  (let [v (copy-attr el c"AXSize")
+        (mut s) (CGSize :w 0.0 :h 0.0)]
+    (if (nil? v)
+        (None)
+        (do
+          (AXValueGetValue v
+                           (primitive/cast i32 VALUE-CG-SIZE)
+                           (primitive/cast (ptr i8) (mut s)))
+          (release v)
+          (Some s)))))
+
+;;; Move a window; returns the AXError (0 = success). Safe on any thread.
+(defn set-position! [(el (ptr i8)) (x f64) (y f64)] (-> i32)
+  (let [(mut p) (CGPoint :x x :y y)
+        v
+          (AXValueCreate (primitive/cast i32 VALUE-CG-POINT)
+                         (primitive/cast (ptr i8) (mut p)))
+        err (AXUIElementSetAttributeValue el (.position (keys)) v)]
+    (do (release v) err)))
+
+(defn cf-bool [(value bool)] (-> (ptr i8))
+  (if value
+      (extern-object (primitive/linker-address kCFBooleanTrue))
+      (extern-object (primitive/linker-address kCFBooleanFalse))))
+
+;;; AXEnhancedUserInterface makes some apps animate every move; it is switched
+;;; off while moving. Safe on any thread.
+(defn enhanced-ui? [(app (ptr i8))] (-> bool)
+  (let [(mut out) (nil)]
+    (if (= (AXUIElementCopyAttributeValue app (.enhanced-ui (keys)) (mut out))
+           (primitive/cast i32 0))
+        (let [b (!= (CFBooleanGetValue out) (primitive/cast u8 0))]
+          (do (release out) b))
+        false)))
+
+(defn set-enhanced-ui! [(app (ptr i8)) (value bool)] (-> i32)
+  (AXUIElementSetAttributeValue app (.enhanced-ui (keys)) (cf-bool value)))
+
+(defn raise! [(el (ptr i8))] (-> i32)
+  (AXUIElementPerformAction el (nsstr c"AXRaise")))
+
+;;; The window's CGWindowID, or 0 when it has none.
+(defn window-id [(el (ptr i8))] (-> u32)
+  (let [(mut id) (primitive/cast u32 0)]
+    (if (= (_AXUIElementGetWindow el (mut id)) (primitive/cast i32 0))
+        id
+        (primitive/cast u32 0))))
+
+(defn pid-of [(el (ptr i8))] (-> i32)
+  (let [(mut pid) (primitive/cast i32 0)]
+    (do (AXUIElementGetPid el (mut pid)) pid)))
+
+;;; A normal document window: not a dialog, sheet, palette, or full-screen space.
+(defn standard-window? [(el (ptr i8))] (-> bool)
+  (and (string-attr-is? el c"AXRole" c"AXWindow")
+       (string-attr-is? el c"AXSubrole" c"AXStandardWindow")
+       (not (bool-attr el c"AXFullScreen"))))
+
+(defn minimized? [(el (ptr i8))] (-> bool)
+  (bool-attr el c"AXMinimized"))
+
+;;; The app's windows as a +1 CFArray, or null.
+(defn copy-windows [(app (ptr i8))] (-> (ptr i8))
+  (copy-attr app c"AXWindows"))
+
+(defn array-count [(a (ptr i8))] (-> i64)
+  (CFArrayGetCount a))
+
+(defn array-get [(a (ptr i8)) (i i64)] (-> (ptr i8))
+  (CFArrayGetValueAtIndex a i))
+
+;;; The focused window of an app element, +1, or null.
+(defn copy-focused-window [(app (ptr i8))] (-> (ptr i8))
+  (copy-attr app c"AXFocusedWindow"))
+
+(defn title-cstr-into [(el (ptr i8)) (buf (ptr i8)) (cap i64)] (-> bool)
+  (let [v (copy-attr el c"AXTitle")]
+    (if (nil? v)
+        false
+        (let [ok
+                (!= (CFStringGetCString v
+                                        buf
+                                        cap
+                                        (primitive/cast u32 134217984))
+                    (primitive/cast u8 0))]
+          (do (release v) ok)))))
+
+(extern CFStringGetCString :cc c [(ptr i8) (ptr i8) i64 u32] (-> u8))
+
+;; ---- observers ----
+
+;;; An observer for `pid` whose events are delivered on the main run loop. +1.
+(defn make-observer [(pid i32)
+                     (callback (fnptr c
+                                      [(ptr i8) (ptr i8) (ptr i8) (ptr i8)]
+                                      void))] (-> (ptr i8))
+  (let [(mut obs) (nil)]
+    (if (= (AXObserverCreate pid callback (mut obs)) (primitive/cast i32 0))
+        (do
+          (CFRunLoopAddSource (CFRunLoopGetMain)
+                              (AXObserverGetRunLoopSource obs)
+                              (extern-object (primitive/linker-address kCFRunLoopDefaultMode)))
+          obs)
+        (nil))))
+
+;;; Subscribe; `refcon` comes back as the callback's last argument.
+(defn observe! [(obs (ptr i8)) (el (ptr i8)) (note (ptr i8)) (refcon (ptr i8))]
+  (-> i32)
+  (AXObserverAddNotification obs el (nsstr note) refcon))
+
+(defn unobserve! [(obs (ptr i8)) (el (ptr i8)) (note (ptr i8))] (-> i32)
+  (AXObserverRemoveNotification obs el (nsstr note)))
+
+;;; The focused window of the frontmost app, +1, or null. (The system-wide
+;;; element's AXFocusedApplication is unreliable for apps activated through
+;;; Accessibility, so the frontmost app comes from NSWorkspace.)
+(defn copy-system-focused-window [] (-> (ptr i8))
+  (let [front
+          (send (send (cls c"NSWorkspace") c"sharedWorkspace")
+                c"frontmostApplication")]
+    (if (nil? front)
+        (nil)
+        (let [app (copy-app (msg i32 front c"processIdentifier" []))
+              w (copy-attr app c"AXFocusedWindow")]
+          (do (release app) w)))))

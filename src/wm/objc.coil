@@ -1,0 +1,164 @@
+(module wm.objc)
+
+;;; Objective-C runtime bridge. Every object, class, and selector is an opaque
+;;; `(ptr i8)`; `msg` casts `objc_msgSend` to the exact C signature of each send.
+
+(import "coil.primitive" :as primitive)
+
+(extern objc_getClass :cc c [(ptr i8)] (-> (ptr i8)))
+
+(extern sel_registerName :cc c [(ptr i8)] (-> (ptr i8)))
+
+(extern objc_msgSend :cc c [(ptr i8) (ptr i8)] (-> (ptr i8)))
+
+(extern objc_allocateClassPair :cc c [(ptr i8) (ptr i8) u64] (-> (ptr i8)))
+
+(extern objc_registerClassPair :cc c [(ptr i8)] (-> void))
+
+(extern class_addMethod :cc c [(ptr i8) (ptr i8) (ptr i8) (ptr i8)] (-> u8))
+
+(extern objc_autoreleasePoolPush :cc c [] (-> (ptr i8)))
+
+(extern objc_autoreleasePoolPop :cc c [(ptr i8)] (-> void))
+
+;;; The nil object.
+(defn nil [] (-> (ptr i8))
+  (primitive/cast (ptr i8) 0))
+
+(defn nil? [(o (ptr i8))] (-> bool)
+  (= o (nil)))
+
+;;; Look up a class by name; panics when the class does not exist.
+(defn cls [(name (ptr i8))] (-> (ptr i8))
+  (let [c (objc_getClass name)]
+    (if (nil? c) (panic "objc: unknown class") c)))
+
+;;; Look up a class that may be absent on this OS version.
+(defn cls-maybe [(name (ptr i8))] (-> (ptr i8))
+  (objc_getClass name))
+
+(defn sel [(name (ptr i8))] (-> (ptr i8))
+  (sel_registerName name))
+
+;;; `(msg RET receiver c"selector:with:" [ArgType…] arg…)` sends a message with
+;;; an explicit C signature. The selector is a C string literal.
+(defn msg [(ret Code)
+           (receiver Code)
+           (selector Code)
+           (argtypes Code)
+           &
+           (args Code)] (-> Code)
+  `(primitive/call-ptr (primitive/cast (fnptr c
+                                              [(ptr i8) (ptr i8) ~@argtypes]
+                                              ~ret)
+                                       (primitive/fnptr-of objc_msgSend))
+                       ~receiver
+                       (sel_registerName ~selector)
+                       ~@args))
+
+;;; `(send receiver c"selector")`: a zero-argument send returning an object.
+(defn send [(receiver Code) (selector Code)] (-> Code)
+  `(objc_msgSend ~receiver (sel_registerName ~selector)))
+
+;;; Begin a subclass of `super-name`; finish it with `finish-class`.
+(defn begin-class [(name (ptr i8)) (super-name (ptr i8))] (-> (ptr i8))
+  (let [c (objc_allocateClassPair (cls super-name) name (primitive/cast u64 0))]
+    (if (nil? c) (panic "objc: class already defined") c)))
+
+;;; Add a method whose implementation is a Coil function pointer, cast to
+;;; `(ptr i8)`. `types` is the Objective-C type encoding, e.g. c"v@:@".
+(defn add-method [(c (ptr i8))
+                  (selector (ptr i8))
+                  (imp (ptr i8))
+                  (types (ptr i8))] (-> i64)
+  (if (= (class_addMethod c (sel selector) imp types) (primitive/cast u8 0))
+      (panic "objc: class_addMethod failed")
+      0))
+
+(defn finish-class [(c (ptr i8))] (-> (ptr i8))
+  (do (objc_registerClassPair c) c))
+
+(defn pool-push [] (-> (ptr i8))
+  (objc_autoreleasePoolPush))
+
+(defn pool-pop [(p (ptr i8))] (-> i64)
+  (do (objc_autoreleasePoolPop p) 0))
+
+;; ---- blocks and the main queue ----
+
+(defstruct BlockDescriptor [(reserved u64) (size u64)])
+
+;;; The Objective-C block ABI layout for a block with no captured variables.
+(defstruct Block
+  [(isa (ptr u8))
+   (flags i32)
+   (reserved i32)
+   (invoke (ptr i8))
+   (descriptor (ptr BlockDescriptor))])
+
+;; BLOCK_IS_GLOBAL
+(const BLOCK-IS-GLOBAL 268435456)
+
+(defn block-descriptor [] (-> (ptr BlockDescriptor))
+  (primitive/alloc-static BlockDescriptor
+                          (BlockDescriptor
+                            :reserved (primitive/cast u64 0)
+                            :size (primitive/cast u64 (sizeof Block)))))
+
+;;; Turn static storage into a global (never-copied, never-freed) block whose
+;;; invoke function is `invoke`, taking the block pointer as its first argument.
+;;; Pass `(primitive/alloc-static Block)` so each call site owns one cell.
+(defn global-block [(cell (ptr Block)) (invoke (ptr i8))] (-> (ptr i8))
+  (do
+    (set! (.isa cell) (primitive/linker-address _NSConcreteGlobalBlock))
+    (set! (.flags cell) (primitive/cast i32 BLOCK-IS-GLOBAL))
+    (set! (.reserved cell) (primitive/cast i32 0))
+    (set! (.invoke cell) invoke)
+    (set! (.descriptor cell) (block-descriptor))
+    (primitive/cast (ptr i8) cell)))
+
+(extern dispatch_async_f
+        :cc
+        c
+        [(ptr u8) (ptr i8) (fnptr c [(ptr i8)] void)]
+        (-> void))
+
+;;; Run `f` on the main thread's run loop.
+(defn on-main [(f (fnptr c [(ptr i8)] void))] (-> i64)
+  (do
+    (dispatch_async_f (primitive/linker-address _dispatch_main_q) (nil) f)
+    0))
+
+;;; A block carrying one integer, its ticket. Built in caller storage the way
+;;; the compiler builds a stack block; the API it is passed to copies it to
+;;; the heap (Block_copy) before returning, as every asynchronous Cocoa API
+;;; does with its completion handler. The invoke function reads the ticket
+;;; back with `block-ticket`.
+(defstruct TicketBlock
+  [(isa (ptr u8))
+   (flags i32)
+   (reserved i32)
+   (invoke (ptr i8))
+   (descriptor (ptr BlockDescriptor))
+   (ticket i64)])
+
+(defn ticket-block-descriptor [] (-> (ptr BlockDescriptor))
+  (primitive/alloc-static BlockDescriptor
+                          (BlockDescriptor
+                            :reserved (primitive/cast u64 0)
+                            :size (primitive/cast u64 (sizeof TicketBlock)))))
+
+(defn ticket-block [(cell (ptr TicketBlock)) (invoke (ptr i8)) (ticket i64)]
+  (-> (ptr i8))
+  (do
+    (set! (.isa cell) (primitive/linker-address _NSConcreteStackBlock))
+    (set! (.flags cell) (primitive/cast i32 0))
+    (set! (.reserved cell) (primitive/cast i32 0))
+    (set! (.invoke cell) invoke)
+    (set! (.descriptor cell) (ticket-block-descriptor))
+    (set! (.ticket cell) ticket)
+    (primitive/cast (ptr i8) cell)))
+
+;;; The ticket of a block made by `ticket-block` (or its heap copy).
+(defn block-ticket [(block (ptr i8))] (-> i64)
+  (.ticket (primitive/cast (ptr TicketBlock) block)))

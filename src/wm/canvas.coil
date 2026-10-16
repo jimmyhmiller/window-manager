@@ -1,0 +1,120 @@
+(module wm.canvas)
+
+;;; Placement math for a project's canvas. Pure: no AppKit, no AX.
+;;;
+;;; All coordinates are global top-left points (the Accessibility coordinate
+;;; space). A window's canvas position is where it sits when the project's pan
+;;; is zero; panning is horizontal only, so on screen it is at
+;;; `(canvas.x - pan, canvas.y)`. Windows slide with the pan, off the screen
+;;; and back, exactly where the pan puts them.
+;;;
+;;; macOS accepts a window with as little as 1px on screen, but pulls back one
+;;; that is fully off. So a window panned fully out of view waits as a 1px
+;;; sliver at the edge it left by, and slides back from there.
+;;;
+;;; Screens are independent. An edge that borders another display is blocked:
+;;; a window may not cross it, because the part past it would show on that
+;;; display. Such a window waits at the screen's free edge until the pan brings
+;;; it fully back.
+
+(import "wm.cocoa" :use [CGPoint CGSize CGRect])
+
+;;; Which edges of the main screen have another display beyond them.
+(defstruct Edges
+  [(left-blocked bool) (right-blocked bool) (bottom-blocked bool)])
+
+(defsum Placement
+  (Show [(x f64) (y f64)])
+  (Stash [(x f64) (y f64)]))
+
+(defn max-f [(a f64) (b f64)] (-> f64)
+  (if (> a b) a b))
+
+(defn min-f [(a f64) (b f64)] (-> f64)
+  (if (< a b) a b))
+
+(defn clamp [(v f64) (lo f64) (hi f64)] (-> f64)
+  (max-f lo (min-f v hi)))
+
+;;; Overlap of [a, a+alen) and [b, b+blen), or 0.
+(defn overlap [(a f64) (alen f64) (b f64) (blen f64)] (-> f64)
+  (max-f 0.0 (- (min-f (+ a alen) (+ b blen)) (max-f a b))))
+
+(defn left-sliver [(screen CGRect) (size CGSize)] (-> f64)
+  (+ (- (.x screen) (.w size)) 1.0))
+
+(defn right-sliver [(screen CGRect)] (-> f64)
+  (- (+ (.x screen) (.w screen)) 1.0))
+
+;;; Where a window waits off screen: the sliver on the side it left by, unless
+;;; that side borders another display. `edges` must leave a side free.
+(defn sliver-x [(screen CGRect) (edges Edges) (size CGSize) (left? bool)]
+  (-> f64)
+  (if (or (and left? (not (.left-blocked edges)))
+          (.right-blocked edges))
+      (left-sliver screen size)
+      (right-sliver screen)))
+
+;;; Where a window at `canvas` goes for the current pan.
+(defn place [(screen CGRect)
+             (edges Edges)
+             (pan f64)
+             (canvas CGPoint)
+             (size CGSize)] (-> Placement)
+  (let [x (- (.x canvas) pan)
+        y (.y canvas)]
+    (if (and (>= (overlap x (.w size) (.x screen) (.w screen)) 1.0)
+             (not (and (.left-blocked edges) (< x (.x screen))))
+             (not (and (.right-blocked edges)
+                       (> (+ x (.w size)) (+ (.x screen) (.w screen))))))
+        (Show x y)
+        (Stash (sliver-x screen edges size (< x (.x screen))) y))))
+
+;;; Where a window of a project that is not showing waits.
+(defn hidden-pos [(screen CGRect) (edges Edges) (size CGSize) (y f64)]
+  (-> CGPoint)
+  (CGPoint :x (sliver-x screen edges size false) :y y))
+
+;;; The canvas position of a window now at `pos`.
+(defn canvas-pos [(pan f64) (pos CGPoint)] (-> CGPoint)
+  (CGPoint :x (+ (.x pos) pan) :y (.y pos)))
+
+;;; True when `pos` is a sliver this module would stash a window of `size` at —
+;;; how a restart recognises windows a previous run left off screen.
+(defn stashed-x? [(screen CGRect) (edges Edges) (size CGSize) (pos CGPoint)]
+  (-> bool)
+  (or (and (not (.left-blocked edges)) (= (.x pos) (left-sliver screen size)))
+      (and (not (.right-blocked edges)) (= (.x pos) (right-sliver screen)))))
+
+;;; Which edges of `main` touch one of the `others` (all in top-left coordinates).
+(defn edges-of [(main CGRect) (others (slice CGRect))] (-> Edges)
+  (let [(mut left) false
+        (mut right) false
+        (mut bottom) false
+        (mut i) 0]
+    (do
+      (while (< i (len others))
+        (let [o (get others i)
+              v-overlap (> (overlap (.y o) (.h o) (.y main) (.h main)) 0.0)
+              h-overlap (> (overlap (.x o) (.w o) (.x main) (.w main)) 0.0)]
+          (do
+            (if (and v-overlap
+                     (<= (+ (.x o) (.w o)) (+ (.x main) 1.0))
+                     (>= (+ (.x o) (.w o)) (- (.x main) 1.0)))
+                (set! left true)
+                0)
+            (if (and v-overlap
+                     (<= (.x o) (+ (+ (.x main) (.w main)) 1.0))
+                     (>= (.x o) (- (+ (.x main) (.w main)) 1.0)))
+                (set! right true)
+                0)
+            (if (and h-overlap
+                     (<= (.y o) (+ (+ (.y main) (.h main)) 1.0))
+                     (>= (.y o) (- (+ (.y main) (.h main)) 1.0)))
+                (set! bottom true)
+                0)
+            (set! i (+ i 1)))))
+      (Edges
+        :left-blocked left
+        :right-blocked right
+        :bottom-blocked bottom))))

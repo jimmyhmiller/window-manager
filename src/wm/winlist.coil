@@ -1,0 +1,149 @@
+(module wm.winlist)
+
+;;; The window server's list of on-screen windows, front to back — fast, with
+;;; no Accessibility round trip into other apps.
+
+(import "coil.primitive" :as primitive)
+(import "coil.arraylist" :use [ArrayList])
+(import "wm.objc" :use [nil nil?])
+(import "wm.cocoa" :use [CGPoint CGRect])
+(import "wm.ax" :as ax)
+
+(extern CGWindowListCopyWindowInfo :cc c [u32 u32] (-> (ptr i8)))
+
+(extern CFDictionaryGetValue :cc c [(ptr i8) (ptr i8)] (-> (ptr i8)))
+
+(extern CFNumberGetValue :cc c [(ptr i8) i64 (ptr i8)] (-> u8))
+
+(extern CGRectMakeWithDictionaryRepresentation
+        :cc
+        c
+        [(ptr i8) (ptr CGRect)]
+        (-> u8))
+
+;; kCGWindowListOptionOnScreenOnly | kCGWindowListExcludeDesktopElements
+(const ON-SCREEN 17)
+
+;; kCFNumberSInt64Type
+(const SINT64 4)
+
+(defn key [(address (ptr u8))] (-> (ptr i8))
+  (ax/extern-object address))
+
+(defn number [(info (ptr i8)) (k (ptr i8))] (-> i64)
+  (let [(mut out) 0]
+    (do
+      (CFNumberGetValue (CFDictionaryGetValue info k)
+                        SINT64
+                        (primitive/cast (ptr i8) (mut out)))
+      (load out))))
+
+(defn bounds [(info (ptr i8))] (-> CGRect)
+  (let [(mut r)
+          (CGRect
+            :x 0.0
+            :y 0.0
+            :w 0.0
+            :h 0.0)]
+    (do
+      (CGRectMakeWithDictionaryRepresentation (CFDictionaryGetValue info
+                                                                    (key (primitive/linker-address kCGWindowBounds)))
+                                              (mut r))
+      r)))
+
+(defn copy-list [] (-> (ptr i8))
+  (CGWindowListCopyWindowInfo (primitive/cast u32 ON-SCREEN)
+                              (primitive/cast u32 0)))
+
+;;; Ordinary (layer 0) window ids, front first, into `out`.
+(defn front-to-back! [(out (mut (ArrayList u32)))] (-> i64)
+  (let [list (copy-list)]
+    (if (nil? list)
+        0
+        (let [(mut i) 0]
+          (do
+            (while (< i (ax/CFArrayGetCount list))
+              (let [info (ax/CFArrayGetValueAtIndex list i)]
+                (do
+                  (if (= (number info
+                                 (key (primitive/linker-address kCGWindowLayer)))
+                         0)
+                      (push! (mut out)
+                             (primitive/cast u32
+                                             (number info
+                                                     (key (primitive/linker-address kCGWindowNumber)))))
+                      0)
+                  (set! i (+ i 1)))))
+            (ax/release list)
+            (len out))))))
+
+;;; The frontmost ordinary window under `pt` (global top-left points), or 0.
+(defn window-at [(pt CGPoint)] (-> u32)
+  (let [list (copy-list)]
+    (if (nil? list)
+        (primitive/cast u32 0)
+        (let [(mut i) 0
+              (mut found) (primitive/cast u32 0)]
+          (do
+            (while (and (< i (ax/CFArrayGetCount list))
+                        (= found (primitive/cast u32 0)))
+              (let [info (ax/CFArrayGetValueAtIndex list i)
+                    b (bounds info)]
+                (do
+                  (if (and (= (number info
+                                      (key (primitive/linker-address kCGWindowLayer)))
+                              0)
+                           (>= (.x pt) (.x b))
+                           (< (.x pt) (+ (.x b) (.w b)))
+                           (>= (.y pt) (.y b))
+                           (< (.y pt) (+ (.y b) (.h b))))
+                      (set! found
+                            (primitive/cast u32
+                                            (number info
+                                                    (key (primitive/linker-address kCGWindowNumber)))))
+                      0)
+                  (set! i (+ i 1)))))
+            (ax/release list)
+            found)))))
+
+;;; A window's frame as the window server reports it.
+(defstruct Frame [(id u32) (x f64) (y f64) (w f64) (h f64)])
+
+;;; Every on-screen ordinary window's frame, into `out`.
+(defn frames! [(out (mut (ArrayList Frame)))] (-> i64)
+  (let [list (copy-list)]
+    (if (nil? list)
+        0
+        (let [(mut i) 0]
+          (do
+            (while (< i (ax/CFArrayGetCount list))
+              (let [info (ax/CFArrayGetValueAtIndex list i)]
+                (do
+                  (if (= (number info
+                                 (key (primitive/linker-address kCGWindowLayer)))
+                         0)
+                      (let [b (bounds info)]
+                        (push! (mut out)
+                               (Frame
+                                 :id
+                                   (primitive/cast u32
+                                                   (number info
+                                                           (key (primitive/linker-address kCGWindowNumber))))
+                                 :x (.x b)
+                                 :y (.y b)
+                                 :w (.w b)
+                                 :h (.h b))))
+                      0)
+                  (set! i (+ i 1)))))
+            (ax/release list)
+            (len out))))))
+
+(defn frame-of [(frames (ArrayList Frame)) (id u32)] (-> (Option Frame))
+  (let [(mut i) 0
+        (mut found) -1]
+    (do
+      (while (and (< i (len frames)) (< found 0))
+        (do
+          (if (= (.id (get frames i)) id) (set! found i) 0)
+          (set! i (+ i 1))))
+      (if (< found 0) (None) (Some (get frames found))))))

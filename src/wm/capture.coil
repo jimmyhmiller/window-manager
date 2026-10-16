@@ -1,0 +1,211 @@
+(module wm.capture)
+
+;;; Window thumbnails through ScreenCaptureKit. `refresh!` lists the windows
+;;; on screen, screenshots each one in turn, and then calls the completion on
+;;; the main thread. All state is touched only on the main thread; the
+;;; ScreenCaptureKit callbacks hand their results over through `pending`.
+
+(import "coil.primitive" :as primitive)
+(import "coil.alloc" :use [malloc-allocator])
+(import "coil.arraylist" :use [ArrayList])
+(import "coil.str" :use [from-cstr])
+(import "wm.objc" :use *)
+(import "wm.cocoa" :use *)
+
+(extern getpid :cc c [] (-> i32))
+
+(extern CGImageRetain :cc c [(ptr i8)] (-> (ptr i8)))
+
+(extern CGImageRelease :cc c [(ptr i8)] (-> void))
+
+;; Smallest window worth showing; skips palettes, popovers, and toolbars.
+(const MIN-WIDTH 200.0)
+
+(const MIN-HEIGHT 150.0)
+
+;;; One on-screen window and its latest thumbnail (null until captured, or
+;;; when its capture failed).
+(defstruct Shot
+  [(window (ptr i8))
+   (frame CGRect)
+   (image (ptr i8))])
+
+(defstruct Capture
+  [(shots (ArrayList Shot))
+   (next i64)
+   (thumb-width f64)
+   (pending (ptr i8))
+   (busy bool)
+   (on-done (fnptr c [] void))])
+
+(defn state [] (-> (ptr Capture))
+  (primitive/alloc-static Capture))
+
+(defn shot-count [] (-> i64)
+  (len (.shots (state))))
+
+(defn shot [(i i64)] (-> Shot)
+  (get (.shots (state)) i))
+
+;;; The CGWindowID of the shot's window.
+(defn shot-window-id [(s Shot)] (-> u32)
+  (msg u32 (.window s) c"windowID" []))
+
+;;; The owning application's name, e.g. "Safari".
+(defn shot-app-name [(s Shot)] (-> (ptr i8))
+  (nsstr-cstr (send (send (.window s) c"owningApplication") c"applicationName")))
+
+;;; Start a capture pass; widths are in pixels. Panics if one is running.
+(defn refresh! [(thumb-width f64) (on-done (fnptr c [] void))] (-> i64)
+  (if (.busy (state))
+      (panic "capture: refresh! while a pass is running")
+      (do
+        (set! (.busy (state)) true)
+        (set! (.thumb-width (state)) thumb-width)
+        (set! (.on-done (state)) on-done)
+        (msg void
+             (cls c"SCShareableContent")
+             c"getShareableContentWithCompletionHandler:"
+             [(ptr i8)]
+             (global-block (primitive/alloc-static Block)
+                           (primitive/cast (ptr i8) (fnptr-of content-arrived))))
+        0)))
+
+(defn report-error [(what (slice u8)) (error (ptr i8))] (-> i64)
+  (if (nil? error)
+      0
+      (do
+        (println "[capture] {s}: {s}"
+                 what
+                 (from-cstr (nsstr-cstr (send error c"localizedDescription"))))
+        0)))
+
+;; ScreenCaptureKit queue
+(defn content-arrived [(block (ptr i8)) (content (ptr i8)) (error (ptr i8))]
+  (-> void)
+  (do
+    (report-error "listing windows" error)
+    (set! (.pending (state)) (if (nil? content) (nil) (send content c"retain")))
+    (on-main (fnptr-of content-ready))))
+
+(defn release-shots! [] (-> i64)
+  (let [(mut i) 0]
+    (do
+      (while (< i (shot-count))
+        (let [s (shot i)]
+          (do
+            (if (nil? (.image s)) 0 (do (CGImageRelease (.image s)) 0))
+            (send (.window s) c"release")
+            (set! i (+ i 1)))))
+      (clear! (mut (.shots (state)))))))
+
+(defn wanted? [(w (ptr i8))] (-> bool)
+  (let [frame (msg CGRect w c"frame" [])
+        app (send w c"owningApplication")]
+    (and (= (msg i64 w c"windowLayer" []) 0)
+         (!= (msg u8 w c"isOnScreen" []) (primitive/cast u8 0))
+         (>= (.w frame) MIN-WIDTH)
+         (>= (.h frame) MIN-HEIGHT)
+         (not (nil? app))
+         (!= (msg i32 app c"processID" []) (getpid)))))
+
+;; main thread
+(defn content-ready [(ctx (ptr i8))] (-> void)
+  (let [content (.pending (state))]
+    (do
+      (release-shots!)
+      (if (nil? content)
+          0
+          (let [windows (send content c"windows")
+                n (msg i64 windows c"count" [])
+                (mut i) 0]
+            (do
+              (while (< i n)
+                (let [w
+                        (msg (ptr i8)
+                             windows
+                             c"objectAtIndex:"
+                             [u64]
+                             (primitive/cast u64 (load i)))]
+                  (do
+                    (if (wanted? w)
+                        (push! (mut (.shots (state)))
+                               (Shot
+                                 :window (send w c"retain")
+                                 :frame (msg CGRect w c"frame" [])
+                                 :image (nil)))
+                        0)
+                    (set! i (+ i 1)))))
+              (send content c"release")
+              0)))
+      (set! (.next (state)) 0)
+      (capture-next!)
+      0)))
+
+(defn capture-next! [] (-> i64)
+  (let [i (.next (state))]
+    (if (>= i (shot-count))
+        (do
+          (set! (.busy (state)) false)
+          (call-ptr (.on-done (state)))
+          0)
+        (let [s (shot i)
+              filter
+                (msg (ptr i8)
+                     (send (cls c"SCContentFilter") c"alloc")
+                     c"initWithDesktopIndependentWindow:"
+                     [(ptr i8)]
+                     (.window s))
+              config (send (cls c"SCStreamConfiguration") c"new")
+              width (.thumb-width (state))
+              height (* width (/ (.h (.frame s)) (.w (.frame s))))]
+          (do
+            (msg void config c"setWidth:" [u64] (primitive/cast u64 width))
+            (msg void config c"setHeight:" [u64] (primitive/cast u64 height))
+            (msg void config c"setShowsCursor:" [u8] (primitive/cast u8 0))
+            (msg void
+                 config
+                 c"setIgnoreShadowsSingleWindow:"
+                 [u8]
+                 (primitive/cast u8 1))
+            (msg void
+                 (cls c"SCScreenshotManager")
+                 c"captureImageWithFilter:configuration:completionHandler:"
+                 [(ptr i8) (ptr i8) (ptr i8)]
+                 filter
+                 config
+                 (global-block (primitive/alloc-static Block)
+                               (primitive/cast (ptr i8)
+                                               (fnptr-of image-arrived))))
+            (send filter c"release")
+            (send config c"release")
+            0)))))
+
+;; ScreenCaptureKit queue
+(defn image-arrived [(block (ptr i8)) (image (ptr i8)) (error (ptr i8))]
+  (-> void)
+  (do
+    (report-error "capturing a window" error)
+    (set! (.pending (state)) (if (nil? image) (nil) (CGImageRetain image)))
+    (on-main (fnptr-of image-ready))))
+
+;; main thread
+(defn image-ready [(ctx (ptr i8))] (-> void)
+  (let [i (.next (state))
+        s (shot i)]
+    (do
+      (set! (mut (.shots (state)))
+            i
+            (Shot
+              :window (.window s)
+              :frame (.frame s)
+              :image (.pending (state))))
+      (set! (.next (state)) (+ i 1))
+      (capture-next!)
+      0)))
+
+;;; Call once before the first `refresh!`.
+(defn init! [] (-> i64)
+  (do
+    (set! (.shots (state)) (ArrayList::new (malloc-allocator)))
+    0))

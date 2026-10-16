@@ -1,0 +1,9 @@
+(module wm.rescue-main)
+
+;;; `build/release/rescue`: bring every off-screen window back into view.
+;;; Build with `coil build src/rescue.coil -o build/release/rescue`.
+
+(import "wm.rescue" :as rescue)
+
+(defn main [] (-> i64)
+  (do (rescue/rescue-lost-windows!) 0))

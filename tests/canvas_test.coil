@@ -1,0 +1,184 @@
+(module wm.canvas-test)
+(import "wm.cocoa" :use [CGPoint CGSize CGRect])
+(import "wm.canvas" :use *)
+
+(defn screen [] (-> CGRect)
+  (CGRect
+    :x 0.0
+    :y 0.0
+    :w 2000.0
+    :h 1300.0))
+
+(defn size [] (-> CGSize)
+  (CGSize :w 400.0 :h 300.0))
+
+(defn free [] (-> Edges)
+  (Edges
+    :left-blocked false
+    :right-blocked false
+    :bottom-blocked false))
+
+;; a second display to the left, like a Studio Display beside a laptop
+(defn left-taken [] (-> Edges)
+  (Edges
+    :left-blocked true
+    :right-blocked false
+    :bottom-blocked false))
+
+(defn shown-at [(p Placement) (x f64) (y f64)] (-> bool)
+  (match p
+    (Show [sx sy] (and (= sx x) (= sy y)))
+    (Stash [_ _] false)))
+
+(defn stashed-at [(p Placement) (x f64) (y f64)] (-> bool)
+  (match p
+    (Show [_ _] false)
+    (Stash [px py] (and (= px x) (= py y)))))
+
+(deftest with-no-pan-windows-stay-exactly-where-they-are
+  (assert (shown-at (place (screen)
+                           (free)
+                           0.0
+                           (CGPoint :x 123.0 :y 456.0)
+                           (size))
+                    123.0
+                    456.0)))
+
+(deftest panning-slides-windows-sideways-only
+  (assert (shown-at (place (screen)
+                           (free)
+                           300.0
+                           (CGPoint :x 500.0 :y 456.0)
+                           (size))
+                    200.0
+                    456.0))
+  (assert (shown-at (place (screen)
+                           (free)
+                           -300.0
+                           (CGPoint :x 500.0 :y 456.0)
+                           (size))
+                    800.0
+                    456.0)))
+
+(deftest a-window-mostly-off-screen-is-still-exactly-where-the-pan-puts-it
+  (assert (shown-at (place (screen)
+                           (free)
+                           500.0
+                           (CGPoint :x 101.0 :y 50.0)
+                           (size))
+                    -399.0
+                    50.0))
+  (assert (shown-at (place (screen)
+                           (free)
+                           -1899.0
+                           (CGPoint :x 100.0 :y 50.0)
+                           (size))
+                    1999.0
+                    50.0)))
+
+(deftest fully-off-screen-windows-wait-at-the-edge-they-left-by
+  (assert (stashed-at (place (screen)
+                             (free)
+                             1000.0
+                             (CGPoint :x 100.0 :y 50.0)
+                             (size))
+                      -399.0
+                      50.0))
+  (assert (stashed-at (place (screen)
+                             (free)
+                             -3000.0
+                             (CGPoint :x 100.0 :y 50.0)
+                             (size))
+                      1999.0
+                      50.0)))
+
+(deftest windows-never-wait-on-a-neighbouring-display
+  ;; left the screen to the left, but another display is there: wait on the right
+  (assert (stashed-at (place (screen)
+                             (left-taken)
+                             1000.0
+                             (CGPoint :x 100.0 :y 50.0)
+                             (size))
+                      1999.0
+                      50.0))
+  ;; screens are independent: a window that would cross onto the neighbour waits too
+  (assert (stashed-at (place (screen)
+                             (left-taken)
+                             200.0
+                             (CGPoint :x 100.0 :y 50.0)
+                             (size))
+                      1999.0
+                      50.0))
+  ;; the free edge still lets windows slide partly off
+  (assert (shown-at (place (screen)
+                           (left-taken)
+                           -1700.0
+                           (CGPoint :x 100.0 :y 50.0)
+                           (size))
+                    1800.0
+                    50.0)))
+
+(deftest hidden-projects-wait-on-a-free-edge
+  (let [p (hidden-pos (screen) (free) (size) 70.0)
+        q
+          (hidden-pos (screen)
+                      (Edges
+                        :left-blocked false
+                        :right-blocked true
+                        :bottom-blocked false)
+                      (size)
+                      70.0)]
+    (assert-eq (.x p) 1999.0)
+    (assert-eq (.y p) 70.0)
+    (assert-eq (.x q) -399.0)))
+
+(deftest canvas-positions-undo-the-pan
+  (let [c (canvas-pos 250.0 (CGPoint :x 100.0 :y 70.0))]
+    (assert-eq (.x c) 350.0)
+    (assert-eq (.y c) 70.0)))
+
+(deftest stashed-positions-are-recognised
+  (assert (stashed-x? (screen) (free) (size) (CGPoint :x -399.0 :y 300.0)))
+  (assert (stashed-x? (screen) (free) (size) (CGPoint :x 1999.0 :y 300.0)))
+  (assert (not (stashed-x? (screen)
+                           (left-taken)
+                           (size)
+                           (CGPoint :x -399.0 :y 300.0))))
+  (assert (not (stashed-x? (screen) (free) (size) (CGPoint :x 10.0 :y 300.0)))))
+
+(deftest neighbouring-displays-are-detected
+  ;; laptop 2056x1329 at the origin; Studio Display 3200x1800 to its left, as macOS reports it
+  (let [laptop
+          (CGRect
+            :x 0.0
+            :y 0.0
+            :w 2056.0
+            :h 1329.0)
+        e
+          (edges-of laptop
+                    [(CGRect
+                       :x -3200.0
+                       :y -693.0
+                       :w 3200.0
+                       :h 1800.0)])
+        alone
+          (edges-of laptop
+                    [(CGRect
+                       :x 5000.0
+                       :y 0.0
+                       :w 100.0
+                       :h 100.0)])
+        below
+          (edges-of laptop
+                    [(CGRect
+                       :x 0.0
+                       :y 1329.0
+                       :w 1920.0
+                       :h 1080.0)])]
+    (assert (.left-blocked e))
+    (assert (not (.right-blocked e)))
+    (assert (not (.bottom-blocked e)))
+    (assert (not (or (.left-blocked alone)
+                     (.right-blocked alone)
+                     (.bottom-blocked alone))))
+    (assert (.bottom-blocked below))))

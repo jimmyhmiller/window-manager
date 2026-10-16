@@ -1,0 +1,241 @@
+(module wm.cocoa)
+
+;;; Thin AppKit helpers over `wm.objc`: geometry, strings, colors, fonts,
+;;; SF Symbols, and view plumbing.
+
+(import "coil.primitive" :as primitive)
+(import "wm.objc" :use *)
+
+(defstruct CGPoint [(x f64) (y f64)])
+
+(defstruct CGSize [(w f64) (h f64)])
+
+;; Flattened {origin, size}; same C layout as CGRect / NSRect.
+(defstruct CGRect [(x f64) (y f64) (w f64) (h f64)])
+
+(defn rect [(x f64) (y f64) (w f64) (h f64)] (-> CGRect)
+  (CGRect
+    :x x
+    :y y
+    :w w
+    :h h))
+
+;; NSAutoresizingMaskOptions
+(const RESIZE-MIN-X 1)
+
+(const RESIZE-WIDTH 2)
+
+(const RESIZE-MAX-X 4)
+
+(const RESIZE-MIN-Y 8)
+
+(const RESIZE-HEIGHT 16)
+
+(const RESIZE-MAX-Y 32)
+
+;; NSLineBreakMode
+(const LINE-BREAK-TRUNCATE-TAIL 4)
+
+;;; An autoreleased NSString copied from a C string.
+(defn nsstr [(s (ptr i8))] (-> (ptr i8))
+  (msg (ptr i8) (cls c"NSString") c"stringWithUTF8String:" [(ptr i8)] s))
+
+;;; The UTF-8 bytes of an NSString, valid while the string lives.
+(defn nsstr-cstr [(s (ptr i8))] (-> (ptr i8))
+  (send s c"UTF8String"))
+
+;;; A named NSColor class color, e.g. c"systemBlueColor" or c"labelColor".
+(defn color [(name (ptr i8))] (-> (ptr i8))
+  (objc_msgSend (cls c"NSColor") (sel name)))
+
+(defn extern-f64 [(p (ptr u8))] (-> f64)
+  (load (primitive/cast (ptr f64) p)))
+
+(defn weight-regular [] (-> f64)
+  (extern-f64 (primitive/linker-address NSFontWeightRegular)))
+
+(defn weight-medium [] (-> f64)
+  (extern-f64 (primitive/linker-address NSFontWeightMedium)))
+
+(defn weight-semibold [] (-> f64)
+  (extern-f64 (primitive/linker-address NSFontWeightSemibold)))
+
+(defn system-font [(size f64) (weight f64)] (-> (ptr i8))
+  (msg (ptr i8)
+       (cls c"NSFont")
+       c"systemFontOfSize:weight:"
+       [f64 f64]
+       size
+       weight))
+
+;;; An SF Symbol at a point size and weight; panics if the symbol name is unknown.
+(defn symbol [(name (ptr i8)) (point-size f64) (weight f64)] (-> (ptr i8))
+  (let [img
+          (msg (ptr i8)
+               (cls c"NSImage")
+               c"imageWithSystemSymbolName:accessibilityDescription:"
+               [(ptr i8) (ptr i8)]
+               (nsstr name)
+               (nil))
+        config
+          (msg (ptr i8)
+               (cls c"NSImageSymbolConfiguration")
+               c"configurationWithPointSize:weight:"
+               [f64 f64]
+               point-size
+               weight)]
+    (if (nil? img)
+        (panic "cocoa: unknown SF Symbol")
+        (msg (ptr i8) img c"imageWithSymbolConfiguration:" [(ptr i8)] config))))
+
+;;; `[[Class alloc] initWithFrame:frame]`
+(defn make-view [(class-name (ptr i8)) (frame CGRect)] (-> (ptr i8))
+  (msg (ptr i8)
+       (send (cls class-name) c"alloc")
+       c"initWithFrame:"
+       [CGRect]
+       frame))
+
+(defn add-subview [(parent (ptr i8)) (child (ptr i8))] (-> i64)
+  (do (msg void parent c"addSubview:" [(ptr i8)] child) 0))
+
+(defn set-autoresizing [(view (ptr i8)) (mask u64)] (-> i64)
+  (do (msg void view c"setAutoresizingMask:" [u64] mask) 0))
+
+;;; A non-editable, truncating text label.
+(defn label [(text (ptr i8)) (font (ptr i8)) (text-color (ptr i8))]
+  (-> (ptr i8))
+  (let [field
+          (msg (ptr i8)
+               (cls c"NSTextField")
+               c"labelWithString:"
+               [(ptr i8)]
+               (nsstr text))]
+    (do
+      (msg void field c"setFont:" [(ptr i8)] font)
+      (msg void field c"setTextColor:" [(ptr i8)] text-color)
+      (msg void
+           field
+           c"setLineBreakMode:"
+           [u64]
+           (primitive/cast u64 LINE-BREAK-TRUNCATE-TAIL))
+      field)))
+
+(defn set-frame [(view (ptr i8)) (frame CGRect)] (-> i64)
+  (do (msg void view c"setFrame:" [CGRect] frame) 0))
+
+;;; The primary display: the one with the menu bar, whose top-left corner is
+;;; the origin of global (Accessibility) coordinates. Not `mainScreen`, which
+;;; follows keyboard focus.
+(defn main-screen [] (-> (ptr i8))
+  (let [s (send (send (cls c"NSScreen") c"screens") c"firstObject")]
+    (if (nil? s) (panic "cocoa: no screens") s)))
+
+;;; Screen area excluding the menu bar and Dock, in AppKit (bottom-left) coordinates.
+(defn visible-frame [(screen (ptr i8))] (-> CGRect)
+  (msg CGRect screen c"visibleFrame" []))
+
+;; ---- Core Animation ----
+
+(defstruct CATransform3D
+  [(m11 f64)
+   (m12 f64)
+   (m13 f64)
+   (m14 f64)
+   (m21 f64)
+   (m22 f64)
+   (m23 f64)
+   (m24 f64)
+   (m31 f64)
+   (m32 f64)
+   (m33 f64)
+   (m34 f64)
+   (m41 f64)
+   (m42 f64)
+   (m43 f64)
+   (m44 f64)])
+
+(extern CATransform3DMakeScale :cc c [f64 f64 f64] (-> CATransform3D))
+
+(extern CATransform3DRotate
+        :cc
+        c
+        [CATransform3D f64 f64 f64 f64]
+        (-> CATransform3D))
+
+(extern CATransform3DScale :cc c [CATransform3D f64 f64 f64] (-> CATransform3D))
+
+(extern CATransform3DTranslate
+        :cc
+        c
+        [CATransform3D f64 f64 f64]
+        (-> CATransform3D))
+
+(defn identity-transform [] (-> CATransform3D)
+  (CATransform3DMakeScale 1.0 1.0 1.0))
+
+;;; A perspective projection with the eye `distance` points from the plane.
+(defn perspective [(distance f64)] (-> CATransform3D)
+  (let [(mut t) (identity-transform)]
+    (do
+      (set! (.m34 (mut t)) (/ -1.0 distance))
+      t)))
+
+(defn new-layer [] (-> (ptr i8))
+  (send (cls c"CALayer") c"layer"))
+
+(defn layer-frame! [(layer (ptr i8)) (frame CGRect)] (-> i64)
+  (do (msg void layer c"setFrame:" [CGRect] frame) 0))
+
+(defn layer-add! [(parent (ptr i8)) (child (ptr i8))] (-> i64)
+  (do (msg void parent c"addSublayer:" [(ptr i8)] child) 0))
+
+(defn layer-shadow! [(layer (ptr i8)) (opacity f32) (radius f64) (dy f64)]
+  (-> i64)
+  (do
+    (msg void layer c"setShadowColor:" [(ptr i8)] (cg-color 0.0 1.0))
+    (msg void layer c"setShadowOpacity:" [f32] opacity)
+    (msg void layer c"setShadowRadius:" [f64] radius)
+    (msg void layer c"setShadowOffset:" [CGSize] (CGSize :w 0.0 :h dy))
+    0))
+
+;;; A CGColorRef for a gray level, owned by an autoreleased NSColor.
+(defn cg-color [(white f64) (alpha f64)] (-> (ptr i8))
+  (send (msg (ptr i8)
+             (cls c"NSColor")
+             c"colorWithWhite:alpha:"
+             [f64 f64]
+             white
+             alpha)
+        c"CGColor"))
+
+;;; `[NSColor colorWithWhite:alpha:]`
+(defn gray [(white f64) (alpha f64)] (-> (ptr i8))
+  (msg (ptr i8) (cls c"NSColor") c"colorWithWhite:alpha:" [f64 f64] white alpha))
+
+(defn backing-scale [(screen (ptr i8))] (-> f64)
+  (msg f64 screen c"backingScaleFactor" []))
+
+;; CGWindowLevelKey
+(const WINDOW-LEVEL-KEY-DESKTOP-ICON 18)
+
+(extern CGWindowLevelForKey :cc c [i32] (-> i32))
+
+;;; The level of Finder's desktop icons: above the wallpaper, below every window.
+(defn desktop-icon-level [] (-> i64)
+  (primitive/cast i64
+                  (CGWindowLevelForKey (primitive/cast i32
+                                                       WINDOW-LEVEL-KEY-DESKTOP-ICON))))
+
+;;; Make this (Dock-less) app frontmost so it can take keyboard input.
+;;; `activate` defers to cooperative activation and does nothing for a
+;;; background agent; the explicit ignoring-other-apps form still works for
+;;; the calling app itself.
+(defn activate-self! [] (-> i64)
+  (do
+    (msg void
+         (send (cls c"NSApplication") c"sharedApplication")
+         c"activateIgnoringOtherApps:"
+         [u8]
+         (primitive/cast u8 1))
+    0))

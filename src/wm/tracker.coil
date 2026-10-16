@@ -1,0 +1,482 @@
+(module wm.tracker)
+
+;;; Finds apps and windows and keeps the model in step with them: NSWorkspace
+;;; tells us about apps launching, quitting, and activating; one AXObserver per
+;;; app tells us about its windows appearing, moving, resizing, minimizing,
+;;; gaining focus, and closing.
+
+(import "coil.primitive" :as primitive)
+(import "coil.alloc" :use [malloc-allocator box! destroy])
+(import "coil.arraylist" :use [ArrayList])
+(import "coil.str" :use [from-cstr])
+(import "wm.objc" :use *)
+(import "wm.cocoa" :use *)
+(import "wm.ax" :as ax)
+(import "wm.model" :as model)
+(import "wm.canvas" :as canvas)
+(import "wm.list" :use [remove-swap!])
+
+(extern getenv :cc c [(ptr i8)] (-> (ptr i8)))
+
+(extern strcmp :cc c [(ptr i8) (ptr i8)] (-> i32))
+
+(extern getpid :cc c [] (-> i32))
+
+(extern dispatch_get_global_queue :cc c [i64 u64] (-> (ptr u8)))
+
+;; NSApplicationActivationPolicyRegular: apps with Dock icons and windows
+(const POLICY-REGULAR 0)
+
+;;; Where a newly found window should go: its project, screen, and canvas
+;;; position. `wm.persist` supplies one that recognises windows from a
+;;; previous run.
+(defstruct Claim [(project i64) (screen u32) (canvas CGPoint)])
+
+(defstruct App [(pid i32) (element (ptr i8)) (observer (ptr i8))])
+
+(defstruct Tracker
+  [(apps (ArrayList App))
+   (only-app (ptr i8))
+   (rescanning bool)
+   (claim (fnptr c [u32 i32 (ptr i8) CGPoint CGSize] Claim))])
+
+(defn tracker [] (-> (ptr Tracker))
+  (primitive/alloc-static Tracker))
+
+;;; Default placement: the active project, exactly where the window is now. A
+;;; window left at an edge sliver by a run that did not exit cleanly is brought
+;;; back into view.
+(defn claim-here [(id u32) (pid i32) (el (ptr i8)) (pos CGPoint) (size CGSize)]
+  (-> Claim)
+  (let [si (model/screen-index-of pos size)
+        s (model/screen-at (if (< si 0) 0 si))
+        at
+          (if (canvas/stashed-x? (.frame s) (.edges s) size pos)
+              (CGPoint :x (+ (.x (.visible s)) 40.0) :y (.y pos))
+              pos)
+        w (model/place-here (model/active) at size)]
+    (Claim
+      :project (model/active)
+      :screen (.screen w)
+      :canvas (.canvas w))))
+
+(defn app-index [(pid i32)] (-> i64)
+  (let [(mut i) 0
+        (mut found) -1]
+    (do
+      (while (and (< i (len (.apps (tracker)))) (< found 0))
+        (do
+          (if (= (.pid (get (.apps (tracker)) i)) pid) (set! found i) 0)
+          (set! i (+ i 1))))
+      found)))
+
+(defn note-is? [(note (ptr i8)) (name (ptr i8))] (-> bool)
+  (ax/same? note (nsstr name)))
+
+;; ---- windows ----
+
+;;; Start managing `el` if it is a standard window on the main screen.
+(defn consider-window! [(el (ptr i8)) (pid i32) (observer (ptr i8))] (-> i64)
+  (let [id (ax/window-id el)]
+    (if (or (= id (primitive/cast u32 0))
+            (>= (model/index-of-id id) 0)
+            (not (ax/standard-window? el)))
+        0
+        (match (ax/position el)
+          (None [] 0)
+          (Some [pos]
+                (match (ax/size el)
+                  (None [] 0)
+                  (Some [size]
+                        (if (not (model/on-a-screen? pos size))
+                            0
+                            (let [c
+                                    (call-ptr (.claim (tracker))
+                                              id
+                                              pid
+                                              el
+                                              pos
+                                              size)]
+                              (do
+                                (ax/observe! observer el c"AXWindowMoved" (nil))
+                                (ax/observe! observer
+                                             el
+                                             c"AXWindowResized"
+                                             (nil))
+                                (ax/observe! observer
+                                             el
+                                             c"AXWindowMiniaturized"
+                                             (nil))
+                                (ax/observe! observer
+                                             el
+                                             c"AXWindowDeminiaturized"
+                                             (nil))
+                                (ax/observe! observer
+                                             el
+                                             c"AXUIElementDestroyed"
+                                             (nil))
+                                (ax/observe! observer
+                                             el
+                                             c"AXTitleChanged"
+                                             (nil))
+                                (let [(mut title) (zeroed (array i8 256))]
+                                  (do
+                                    (if (ax/title-cstr-into el
+                                                            (primitive/cast (ptr i8)
+                                                                            (mut title))
+                                                            256)
+                                        0
+                                        (set! (primitive/cast (ptr i8)
+                                                              (mut title))
+                                              (primitive/cast i8 0)))
+                                    (model/add-window! id
+                                                       pid
+                                                       el
+                                                       (primitive/cast (ptr i8)
+                                                                       (mut title))
+                                                       (.project c)
+                                                       (.screen c)
+                                                       (.canvas c)
+                                                       size)))
+                                (if (ax/minimized? el)
+                                    (model/window-minimized! (model/index-of-id id)
+                                                             true)
+                                    0)))))))))))
+
+(defn scan-windows! [(app App)] (-> i64)
+  (let [list (ax/copy-windows (.element app))]
+    (if (nil? list)
+        0
+        (let [(mut i) 0]
+          (do
+            (while (< i (ax/array-count list))
+              (do
+                (consider-window! (ax/array-get list i)
+                                  (.pid app)
+                                  (.observer app))
+                (set! i (+ i 1))))
+            (ax/release list))))))
+
+;;; AXObserver callback, on the main run loop.
+(defn ax-event [(observer (ptr i8))
+                (el (ptr i8))
+                (note (ptr i8))
+                (refcon (ptr i8))] (-> void)
+  (cond (note-is? note c"AXWindowCreated")
+          (consider-window! el (ax/pid-of el) observer)
+        (note-is? note c"AXFocusedWindowChanged")
+          (let [i (model/index-of-element el)]
+            (if (< i 0) 0 (model/window-focused! i)))
+        :else
+          (let [i (model/index-of-element el)]
+            (cond (< i 0) 0
+                  (note-is? note c"AXWindowMoved") (model/window-moved! i)
+                  (note-is? note c"AXWindowResized") (model/window-resized! i)
+                  (note-is? note c"AXWindowMiniaturized")
+                    (model/window-minimized! i true)
+                  (note-is? note c"AXWindowDeminiaturized")
+                    (model/window-minimized! i false)
+                  (note-is? note c"AXUIElementDestroyed")
+                    (model/remove-window! i)
+                  (note-is? note c"AXTitleChanged")
+                    (let [(mut title) (zeroed (array i8 256))]
+                      (if (ax/title-cstr-into el
+                                              (primitive/cast (ptr i8)
+                                                              (mut title))
+                                              256)
+                          (model/set-title! i
+                                            (primitive/cast (ptr i8)
+                                                            (mut title)))
+                          0))
+                  :else 0))))
+
+;; ---- apps ----
+
+(defn app-name-matches? [(running (ptr i8))] (-> bool)
+  (let [only (.only-app (tracker))]
+    (if (nil? only)
+        true
+        (let [name (send running c"localizedName")]
+          (and (not (nil? name))
+               (= (strcmp (nsstr-cstr name) only) (primitive/cast i32 0)))))))
+
+;;; Start tracking a running application (an NSRunningApplication).
+(defn track-app! [(running (ptr i8))] (-> i64)
+  (let [pid (msg i32 running c"processIdentifier" [])]
+    (if (or (>= (app-index pid) 0)
+            (= pid (getpid))
+            (!= (msg i64 running c"activationPolicy" []) POLICY-REGULAR)
+            (not (app-name-matches? running)))
+        0
+        (let [element (ax/copy-app pid)
+              observer (ax/make-observer pid (fnptr-of ax-event))]
+          (if (nil? observer)
+              (do (ax/release element) 0)
+              (let [app
+                      (App
+                        :pid pid
+                        :element element
+                        :observer observer)]
+                (do
+                  (ax/observe! observer element c"AXWindowCreated" (nil))
+                  (ax/observe! observer element c"AXFocusedWindowChanged" (nil))
+                  (push! (mut (.apps (tracker))) app)
+                  (scan-windows! app))))))))
+
+(defn untrack-app! [(pid i32)] (-> i64)
+  (let [i (app-index pid)]
+    (if (< i 0)
+        0
+        (let [app (get (.apps (tracker)) i)]
+          (do
+            (model/remove-app! pid)
+            (ax/release (.observer app))
+            (ax/release (.element app))
+            (remove-swap! (mut (.apps (tracker))) i))))))
+
+;;; The app just activated: its focused window's project becomes active.
+(defn app-activated! [(pid i32)] (-> i64)
+  (let [i (app-index pid)]
+    (if (< i 0)
+        0
+        (let [focused
+                (ax/copy-focused-window (.element (get (.apps (tracker)) i)))]
+          (if (nil? focused)
+              0
+              (let [w (model/index-of-element focused)]
+                (do
+                  (if (< w 0) 0 (model/window-focused! w))
+                  (ax/release focused))))))))
+
+;; ---- NSWorkspace notifications ----
+
+(defn notification-app [(note (ptr i8))] (-> (ptr i8))
+  (msg (ptr i8)
+       (send note c"userInfo")
+       c"objectForKey:"
+       [(ptr i8)]
+       (ax/extern-object (primitive/linker-address NSWorkspaceApplicationKey))))
+
+(defn on-launch [(self (ptr i8)) (cmd (ptr i8)) (note (ptr i8))] (-> void)
+  (track-app! (notification-app note)))
+
+(defn on-terminate [(self (ptr i8)) (cmd (ptr i8)) (note (ptr i8))] (-> void)
+  (untrack-app! (msg i32 (notification-app note) c"processIdentifier" [])))
+
+(defn on-activate [(self (ptr i8)) (cmd (ptr i8)) (note (ptr i8))] (-> void)
+  (let [running (notification-app note)]
+    (do
+      ;; an app that existed before it was regular (or was skipped) may show up here first
+      (track-app! running)
+      (app-activated! (msg i32 running c"processIdentifier" [])))))
+
+(defn on-screens [(self (ptr i8)) (cmd (ptr i8)) (note (ptr i8))] (-> void)
+  (do
+    (model/update-geometry!)
+    (model/layout-all!)))
+
+(defn on-rescan [(self (ptr i8)) (cmd (ptr i8)) (timer (ptr i8))] (-> void)
+  (rescan!))
+
+;; seconds between rescans for windows that appeared without a notification
+(const RESCAN-SECONDS 2.0)
+
+(defn observe-workspace! [] (-> i64)
+  (let [c (begin-class c"WMWorkspaceObserver" c"NSObject")]
+    (do
+      (add-method c
+                  c"appLaunched:"
+                  (primitive/cast (ptr i8) (fnptr-of on-launch))
+                  c"v@:@")
+      (add-method c
+                  c"appTerminated:"
+                  (primitive/cast (ptr i8) (fnptr-of on-terminate))
+                  c"v@:@")
+      (add-method c
+                  c"appActivated:"
+                  (primitive/cast (ptr i8) (fnptr-of on-activate))
+                  c"v@:@")
+      (add-method c
+                  c"screensChanged:"
+                  (primitive/cast (ptr i8) (fnptr-of on-screens))
+                  c"v@:@")
+      (add-method c
+                  c"rescan:"
+                  (primitive/cast (ptr i8) (fnptr-of on-rescan))
+                  c"v@:@")
+      (finish-class c)
+      (let [observer (send (send c c"alloc") c"init")
+            center
+              (send (send (cls c"NSWorkspace") c"sharedWorkspace")
+                    c"notificationCenter")]
+        (do
+          (subscribe! center
+                      observer
+                      c"appLaunched:"
+                      (primitive/linker-address NSWorkspaceDidLaunchApplicationNotification))
+          (subscribe! center
+                      observer
+                      c"appTerminated:"
+                      (primitive/linker-address NSWorkspaceDidTerminateApplicationNotification))
+          (subscribe! center
+                      observer
+                      c"appActivated:"
+                      (primitive/linker-address NSWorkspaceDidActivateApplicationNotification))
+          (subscribe! (send (cls c"NSNotificationCenter") c"defaultCenter")
+                      observer
+                      c"screensChanged:"
+                      (primitive/linker-address NSApplicationDidChangeScreenParametersNotification))
+          (msg (ptr i8)
+               (cls c"NSTimer")
+               c"scheduledTimerWithTimeInterval:target:selector:userInfo:repeats:"
+               [f64 (ptr i8) (ptr i8) (ptr i8) u8]
+               RESCAN-SECONDS
+               observer
+               (sel c"rescan:")
+               (nil)
+               (primitive/cast u8 1))
+          0)))))
+
+(defn subscribe! [(center (ptr i8))
+                  (observer (ptr i8))
+                  (selector (ptr i8))
+                  (name-address (ptr u8))] (-> i64)
+  (do
+    (msg void
+         center
+         c"addObserver:selector:name:object:"
+         [(ptr i8) (ptr i8) (ptr i8) (ptr i8)]
+         observer
+         (sel selector)
+         (ax/extern-object name-address)
+         (nil))
+    0))
+
+;;; Look for windows that appeared without a notification, such as one dragged
+;;; back onto the main screen from another display.
+;;; A window seen by a background rescan.
+(defstruct Found [(pid i32) (element (ptr i8)) (id u32)])
+
+;;; One background rescan: the apps to ask (elements retained) and what they
+;;; reported.
+(defstruct Rescan [(apps (ArrayList App)) (found (ArrayList Found))])
+
+;; Asking every app for its windows is synchronous IPC, and a slow app would
+;; stall the main thread (input, the display link). So the asking happens on a
+;; background queue; only windows not already tracked come back to the main
+;; thread, which is rare. Rescans also wait while a pan is live.
+(defn rescan! [] (-> i64)
+  (if (or (.rescanning (tracker)) (model/interacting?))
+      0
+      (let [(mut apps) (ArrayList::new [App] (malloc-allocator))
+            (mut i) 0]
+        (do
+          (while (< i (len (.apps (tracker))))
+            (let [a (get (.apps (tracker)) i)]
+              (do
+                (push! (mut apps)
+                       (App
+                         :pid (.pid a)
+                         :element (ax/retain (.element a))
+                         :observer (.observer a)))
+                (set! i (+ i 1)))))
+          (set! (.rescanning (tracker)) true)
+          (let [job
+                  (box! (malloc-allocator)
+                        Rescan
+                        (Rescan
+                          :apps (load apps)
+                          :found (ArrayList::new [Found] (malloc-allocator))))]
+            (dispatch_async_f (dispatch_get_global_queue 0
+                                                         (primitive/cast u64 0))
+                              (primitive/cast (ptr i8) job)
+                              (fnptr-of rescan-work)))
+          0))))
+
+;; background queue
+(defn rescan-work [(ctx (ptr i8))] (-> void)
+  (let [job (primitive/cast (ptr Rescan) ctx)
+        (mut i) 0]
+    (do
+      (while (< i (len (.apps job)))
+        (let [a (get (.apps job) i)
+              list (ax/copy-windows (.element a))]
+          (do
+            (if (nil? list)
+                0
+                (let [(mut k) 0]
+                  (do
+                    (while (< k (ax/array-count list))
+                      (let [el (ax/array-get list k)]
+                        (do
+                          (push! (mut (.found job))
+                                 (Found
+                                   :pid (.pid a)
+                                   :element (ax/retain el)
+                                   :id (ax/window-id el)))
+                          (set! k (+ k 1)))))
+                    (ax/release list))))
+            (set! i (+ i 1)))))
+      (dispatch_async_f (primitive/linker-address _dispatch_main_q)
+                        ctx
+                        (fnptr-of rescan-done)))))
+
+;; main thread
+(defn rescan-done [(ctx (ptr i8))] (-> void)
+  (let [job (primitive/cast (ptr Rescan) ctx)
+        (mut i) 0]
+    (do
+      (while (< i (len (.found job)))
+        (let [f (get (.found job) i)
+              ai (app-index (.pid f))]
+          (do
+            (if (and (>= ai 0)
+                     (!= (.id f) (primitive/cast u32 0))
+                     (< (model/index-of-id (.id f)) 0))
+                (consider-window! (.element f)
+                                  (.pid f)
+                                  (.observer (get (.apps (tracker)) ai)))
+                0)
+            (ax/release (.element f))
+            (set! i (+ i 1)))))
+      (set! i 0)
+      (while (< i (len (.apps job)))
+        (do
+          (ax/release (.element (get (.apps job) i)))
+          (set! i (+ i 1))))
+      (free! (mut (.found job)))
+      (free! (mut (.apps job)))
+      (destroy [Rescan] (malloc-allocator) job)
+      (set! (.rescanning (tracker)) false)
+      0)))
+
+;;; Track every running app and start listening. `claim` decides where newly
+;;; found windows go.
+(defn start! [(claim (fnptr c [u32 i32 (ptr i8) CGPoint CGSize] Claim))]
+  (-> i64)
+  (let [only (getenv c"WM_ONLY_APP")
+        apps
+          (send (send (cls c"NSWorkspace") c"sharedWorkspace")
+                c"runningApplications")
+        n (msg i64 apps c"count" [])
+        (mut i) 0]
+    (do
+      (set! (.apps (tracker)) (ArrayList::new [App] (malloc-allocator)))
+      (set! (.only-app (tracker)) only)
+      (set! (.claim (tracker)) claim)
+      (if (nil? only)
+          0
+          (do (println "[wm] managing only {s}" (from-cstr only)) 0))
+      (while (< i n)
+        (do
+          (track-app! (msg (ptr i8)
+                           apps
+                           c"objectAtIndex:"
+                           [u64]
+                           (primitive/cast u64 (load i))))
+          (set! i (+ i 1))))
+      (observe-workspace!)
+      (println "[wm] tracking {d} windows in {d} apps"
+               (model/win-count)
+               (len (.apps (tracker))))
+      0)))

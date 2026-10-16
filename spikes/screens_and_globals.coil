@@ -1,0 +1,40 @@
+(module screens-and-globals)
+
+(import "coil.primitive" :as primitive)
+(import "coil.io" :use *)
+(import "coil.fmt" :use *)
+
+(extern objc_getClass :cc c [(ptr i8)] (-> (ptr i8)))
+(extern sel_registerName :cc c [(ptr i8)] (-> (ptr i8)))
+(extern objc_msgSend :cc c [(ptr i8) (ptr i8)] (-> (ptr i8)))
+(extern CFGetTypeID :cc c [(ptr i8)] (-> u64))
+(extern CFStringGetTypeID :cc c [] (-> u64))
+(extern CFStringGetLength :cc c [(ptr i8)] (-> i64))
+
+(defstruct CGRect [(x f64) (y f64) (w f64) (h f64)])
+
+(defn main [] (-> i64)
+  (let [screens (objc_msgSend (objc_getClass c"NSScreen") (sel_registerName c"screens"))
+        n (primitive/call-ptr (primitive/cast (fnptr c [(ptr i8) (ptr i8)] i64) (primitive/fnptr-of objc_msgSend))
+                              screens (sel_registerName c"count"))
+        (mut i) 0
+        ; extern data: kCFRunLoopDefaultMode is a `const CFStringRef` global
+        modep (primitive/cast (ptr (ptr i8)) (primitive/linker-address kCFRunLoopDefaultMode))
+        mode (primitive/load modep)]
+    (do
+      (println "kCFRunLoopDefaultMode is CFString: {d} len {d}"
+               (if (= (CFGetTypeID mode) (CFStringGetTypeID)) 1 0)
+               (CFStringGetLength mode))
+      (while (< (load i) n)
+        (let [s (primitive/call-ptr (primitive/cast (fnptr c [(ptr i8) (ptr i8) i64] (ptr i8)) (primitive/fnptr-of objc_msgSend))
+                                    screens (sel_registerName c"objectAtIndex:") (load i))
+              f (primitive/call-ptr (primitive/cast (fnptr c [(ptr i8) (ptr i8)] CGRect) (primitive/fnptr-of objc_msgSend))
+                                    s (sel_registerName c"frame"))
+              v (primitive/call-ptr (primitive/cast (fnptr c [(ptr i8) (ptr i8)] CGRect) (primitive/fnptr-of objc_msgSend))
+                                    s (sel_registerName c"visibleFrame"))]
+          (do
+            (println "screen {d}: frame ({f},{f}) {f}x{f}  visible ({f},{f}) {f}x{f}" (load i)
+                     (field f x) (field f y) (field f w) (field f h)
+                     (field v x) (field v y) (field v w) (field v h))
+            (set! i (+ (load i) 1)))))
+      0)))

@@ -1,0 +1,262 @@
+(module wm.pan)
+
+;;; Panning gestures, paced to the display. Scroll deltas accumulate between
+;;; frames and a display link applies them once per refresh, on the screen the
+;;; gesture started on. A gesture ends once its scroll and momentum events stop.
+;;;
+;;; How a pan looks depends on the mode:
+;;;   Direct      the real windows move every frame
+;;;   Glide       pictures of the windows move every frame (`wm.overlay`) while
+;;;               the real windows catch up underneath; the pictures fade away
+;;;               once every real window has arrived
+;;;   Live Glide  like Glide, with live video pictures
+
+(import "coil.primitive" :as primitive)
+(import "wm.objc" :use *)
+(import "wm.cocoa" :use *)
+(import "wm.model" :as model)
+(import "wm.mover" :as mover)
+(import "wm.overlay" :as overlay)
+(import "wm.peek" :as peek)
+(import "wm.clock" :use [now-ms now-us])
+
+(extern getenv :cc c [(ptr i8)] (-> (ptr i8)))
+
+(defsum Mode (Direct) (Glide) (LiveGlide))
+
+;; No scroll event for this long ends the gesture (momentum starts within it).
+(const QUIET-MS 120)
+
+;; A Glide never waits longer than this for slow apps before letting go.
+(const MAX-SETTLE-MS 1500)
+
+;; Share of an arrow-key step applied per frame (ease out).
+(const STEP-EASE 0.22)
+
+(defstruct Pan
+  [(mode Mode)
+   (active bool)
+   (screen u32)
+   (pending f64)
+   (step-left f64)
+   (last-input-ms i64)
+   (overlaid bool)
+   (settling bool)
+   (settle-start-ms i64)
+   (link (ptr i8))
+   (target (ptr i8))
+   ;; WM_DEBUG_PAN statistics for the current gesture
+   (frames i64)
+   (last-tick-us i64)
+   (worst-gap-us i64)
+   (worst-work-us i64)])
+
+(defn debug? [] (-> bool)
+  (not (nil? (getenv c"WM_DEBUG_PAN"))))
+
+(defn mode-name [] (-> (slice u8))
+  (match (.mode (state))
+    (Direct [] "Direct")
+    (Glide [] "Glide")
+    (LiveGlide [] "Live Glide")))
+
+(defn state [] (-> (ptr Pan))
+  (primitive/alloc-static Pan))
+
+(defn mode [] (-> Mode)
+  (.mode (state)))
+
+(defn set-mode! [(m Mode)] (-> i64)
+  (do (set! (.mode (state)) m) 0))
+
+;;; True when this gesture is showing pictures (a Glide whose pictures were
+;;; ready); otherwise the real windows move directly.
+(defn glide? [] (-> bool)
+  (.overlaid (state)))
+
+(defn abs-f [(x f64)] (-> f64)
+  (if (< x 0.0) (- 0.0 x) x))
+
+;; ---- the display link ----
+
+(defn ns-screen-for [(id u32)] (-> (ptr i8))
+  (let [screens (send (cls c"NSScreen") c"screens")
+        n (msg i64 screens c"count" [])
+        (mut i) 0
+        (mut found) (nil)]
+    (do
+      (while (and (< i n) (nil? found))
+        (let [s
+                (msg (ptr i8)
+                     screens
+                     c"objectAtIndex:"
+                     [u64]
+                     (primitive/cast u64 (load i)))]
+          (do
+            (if (= (model/display-id s) id) (set! found s) 0)
+            (set! i (+ i 1)))))
+      (if (nil? found) (main-screen) found))))
+
+(defn start-link! [] (-> i64)
+  (let [link
+          (msg (ptr i8)
+               (ns-screen-for (.screen (state)))
+               c"displayLinkWithTarget:selector:"
+               [(ptr i8) (ptr i8)]
+               (.target (state))
+               (sel c"tick:"))]
+    (do
+      (msg void
+           link
+           c"addToRunLoop:forMode:"
+           [(ptr i8) (ptr i8)]
+           (send (cls c"NSRunLoop") c"mainRunLoop")
+           (extern-object (primitive/linker-address NSRunLoopCommonModes)))
+      (set! (.link (state)) link)
+      0)))
+
+(defn stop-link! [] (-> i64)
+  (if (nil? (.link (state)))
+      0
+      (do
+        (msg void (.link (state)) c"invalidate" [])
+        (set! (.link (state)) (nil))
+        0)))
+
+(defn extern-object [(address (ptr u8))] (-> (ptr i8))
+  (primitive/load (primitive/cast (ptr (ptr i8)) address)))
+
+;; ---- gestures ----
+
+(defn begin! [(screen u32)] (-> i64)
+  (do
+    (model/set-interacting! true)
+    (set! (.active (state)) true)
+    (set! (.settling (state)) false)
+    (set! (.screen (state)) screen)
+    (set! (.pending (state)) 0.0)
+    (set! (.step-left (state)) 0.0)
+    (set! (.overlaid (state))
+          (match (mode)
+            (Direct [] false)
+            (Glide [] (overlay/begin! screen false))
+            (LiveGlide [] (overlay/begin! screen true))))
+    (match (mode)
+      (Direct [] 0)
+      (_ (if (.overlaid (state))
+             0
+             (do
+               (println "[pan] pictures not ready; this pan moves the windows directly")
+               0))))
+    (set! (.frames (state)) 0)
+    (set! (.last-tick-us (state)) 0)
+    (set! (.worst-gap-us (state)) 0)
+    (set! (.worst-work-us (state)) 0)
+    (start-link!)))
+
+(defn finish! [] (-> i64)
+  (do
+    (stop-link!)
+    (if (debug?)
+        (do
+          (println "[pan] {s}{s}: {d} frames, worst gap between frames {d}us, worst main-thread work {d}us"
+                   (mode-name)
+                   (if (.overlaid (state)) " (pictures)" "")
+                   (.frames (state))
+                   (.worst-gap-us (state))
+                   (.worst-work-us (state)))
+          0)
+        0)
+    ;; peeks first, so they are in place as the pictures fade
+    (peek/update!)
+    (if (glide?) (overlay/finish!) 0)
+    (set! (.overlaid (state)) false)
+    (set! (.active (state)) false)
+    (set! (.settling (state)) false)
+    (model/set-interacting! false)
+    0))
+
+;;; A new gesture on another screen first ends the one in progress.
+(defn ensure-gesture! [(screen u32)] (-> i64)
+  (cond (not (.active (state))) (begin! screen)
+        (!= (.screen (state)) screen) (do (finish!) (begin! screen))
+        :else
+          (do
+            ;; input resumed while the pictures were waiting to fade: keep gliding
+            (set! (.settling (state)) false)
+            0)))
+
+;;; One scroll event of a pan on `screen` moving content by `dx` points.
+(defn scroll! [(screen u32) (dx f64)] (-> i64)
+  (do
+    (ensure-gesture! screen)
+    (set! (.pending (state)) (+ (.pending (state)) dx))
+    (set! (.last-input-ms (state)) (now-ms))
+    0))
+
+;;; An eased pan by `dx` points on `screen`, as for an arrow key.
+(defn step! [(screen u32) (dx f64)] (-> i64)
+  (do
+    (ensure-gesture! screen)
+    (set! (.step-left (state)) (+ (.step-left (state)) dx))
+    (set! (.last-input-ms (state)) (now-ms))
+    0))
+
+;;; Glide back to where the active project started on `screen`.
+(defn reset! [(screen u32)] (-> i64)
+  (step! screen (model/pan-of (model/active) screen)))
+
+;; Called once per display refresh while a gesture is live.
+(defn tick [(self (ptr i8)) (cmd (ptr i8)) (link (ptr i8))] (-> void)
+  (let [s (state)
+        started (now-us)
+        eased
+          (if (< (abs-f (.step-left s)) 0.5)
+              (.step-left s)
+              (* (.step-left s) STEP-EASE))
+        d (+ (.pending s) eased)]
+    (do
+      (if (> (.last-tick-us s) 0)
+          (let [gap (- started (.last-tick-us s))]
+            (if (> gap (.worst-gap-us s)) (set! (.worst-gap-us s) gap) 0))
+          0)
+      (set! (.last-tick-us s) started)
+      (set! (.frames s) (+ (.frames s) 1))
+      (set! (.pending s) 0.0)
+      (set! (.step-left s) (- (.step-left s) eased))
+      (if (= d 0.0)
+          0
+          (do
+            (model/pan-by! (.screen s) d)
+            (if (glide?) 0 (peek/update!))
+            (if (glide?) (overlay/shift! d) 0)
+            (set! (.last-input-ms s)
+                  (if (!= eased 0.0) (now-ms) (.last-input-ms s)))
+            0))
+      (let [work (- (now-us) started)]
+        (if (> work (.worst-work-us s)) (set! (.worst-work-us s) work) 0))
+      (if (or (< (- (now-ms) (.last-input-ms s)) QUIET-MS)
+              (!= (.step-left s) 0.0))
+          0
+          (cond (not (glide?)) (finish!)
+                (not (.settling s))
+                  (do
+                    (set! (.settling s) true)
+                    (set! (.settle-start-ms s) (now-ms))
+                    0)
+                (or (mover/all-idle?)
+                    (> (- (now-ms) (.settle-start-ms s)) MAX-SETTLE-MS))
+                  (finish!)
+                :else 0)))))
+
+(defn init! [] (-> i64)
+  (let [c (begin-class c"WMPanTicker" c"NSObject")]
+    (do
+      (add-method c c"tick:" (primitive/cast (ptr i8) (fnptr-of tick)) c"v@:@")
+      (finish-class c)
+      (set! (.target (state)) (send (send c c"alloc") c"init"))
+      (set! (.mode (state)) (Glide))
+      (set! (.active (state)) false)
+      (set! (.overlaid (state)) false)
+      (set! (.link (state)) (nil))
+      0)))

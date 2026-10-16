@@ -1,0 +1,148 @@
+(module wm.rescue)
+
+;;; Bring back every window that is (nearly) off screen — for example after
+;;; the window manager was force-quit while windows waited past a screen edge.
+;;; Windows are cascaded onto the primary screen at their current size.
+
+(import "coil.primitive" :as primitive)
+(import "coil.alloc" :use [malloc-allocator])
+(import "coil.arraylist" :use [ArrayList])
+(import "coil.str" :use [from-cstr])
+(import "wm.objc" :use *)
+(import "wm.cocoa" :use *)
+(import "wm.ax" :as ax)
+(import "wm.canvas" :as canvas)
+
+(extern getpid :cc c [] (-> i32))
+
+;; A window showing less than this on every display counts as lost.
+(const MIN-VISIBLE-W 120.0)
+
+(const MIN-VISIBLE-H 80.0)
+
+(const CASCADE-STEP 36.0)
+
+;;; Every display's frame in global top-left coordinates.
+(defn screen-rects [(out (mut (ArrayList CGRect)))] (-> i64)
+  (let [screens (send (cls c"NSScreen") c"screens")
+        n (msg i64 screens c"count" [])
+        primary-h (.h (msg CGRect (main-screen) c"frame" []))
+        (mut i) 0]
+    (do
+      (while (< i n)
+        (let [f
+                (msg CGRect
+                     (msg (ptr i8)
+                          screens
+                          c"objectAtIndex:"
+                          [u64]
+                          (primitive/cast u64 (load i)))
+                     c"frame"
+                     [])]
+          (do
+            (push! (mut out)
+                   (rect (.x f) (- primary-h (+ (.y f) (.h f))) (.w f) (.h f)))
+            (set! i (+ i 1)))))
+      n)))
+
+(defn lost? [(screens (ArrayList CGRect)) (pos CGPoint) (size CGSize)] (-> bool)
+  (let [(mut i) 0
+        (mut seen) false]
+    (do
+      (while (< i (len screens))
+        (let [s (get screens i)]
+          (do
+            (if (and (>= (canvas/overlap (.x pos) (.w size) (.x s) (.w s))
+                         MIN-VISIBLE-W)
+                     (>= (canvas/overlap (.y pos) (.h size) (.y s) (.h s))
+                         MIN-VISIBLE-H))
+                (set! seen true)
+                0)
+            (set! i (+ i 1)))))
+      (not seen))))
+
+;;; Move every lost window back on screen; returns how many moved.
+(defn rescue-lost-windows! [] (-> i64)
+  (if (not (ax/trusted?))
+      (do (println "rescue needs Accessibility permission") 0)
+      (let [pool (pool-push)
+            primary (main-screen)
+            frame (msg CGRect primary c"frame" [])
+            vf (visible-frame primary)
+            top (- (.h frame) (+ (.y vf) (.h vf)))
+            (mut screens) (ArrayList::new [CGRect] (malloc-allocator))
+            apps
+              (send (send (cls c"NSWorkspace") c"sharedWorkspace")
+                    c"runningApplications")
+            n (msg i64 apps c"count" [])
+            (mut a) 0
+            (mut moved) 0]
+        (do
+          (screen-rects (mut screens))
+          (while (< a n)
+            (let [running
+                    (msg (ptr i8)
+                         apps
+                         c"objectAtIndex:"
+                         [u64]
+                         (primitive/cast u64 (load a)))
+                  pid (msg i32 running c"processIdentifier" [])]
+              (do
+                (if (or (= pid (getpid))
+                        (!= (msg i64 running c"activationPolicy" []) 0))
+                    0
+                    (let [app (ax/copy-app pid)
+                          list (ax/copy-windows app)]
+                      (do
+                        (if (nil? list)
+                            0
+                            (let [(mut i) 0]
+                              (do
+                                (while (< i (ax/array-count list))
+                                  (let [w (ax/array-get list i)]
+                                    (do
+                                      (match (ax/position w)
+                                        (None [] 0)
+                                        (Some [pos]
+                                              (match (ax/size w)
+                                                (None [] 0)
+                                                (Some [size]
+                                                      (if (and (not (ax/minimized? w))
+                                                               (lost? screens
+                                                                      pos
+                                                                      size))
+                                                          (let [k
+                                                                  (primitive/cast f64
+                                                                                  (% (load moved)
+                                                                                     12))
+                                                                x
+                                                                  (+ (+ (.x vf)
+                                                                        60.0)
+                                                                     (* k
+                                                                        CASCADE-STEP))
+                                                                y
+                                                                  (+ (+ top
+                                                                        20.0)
+                                                                     (* k
+                                                                        CASCADE-STEP))]
+                                                            (do
+                                                              (ax/set-position! w
+                                                                                x
+                                                                                y)
+                                                              (println "rescued a window of {s} to {f},{f}"
+                                                                       (from-cstr (nsstr-cstr (send running
+                                                                                                    c"localizedName")))
+                                                                       x
+                                                                       y)
+                                                              (set! moved
+                                                                    (+ moved 1))
+                                                              0))
+                                                          0)))))
+                                      (set! i (+ i 1)))))
+                                (ax/release list)))))
+                      (ax/release app))))
+              (set! a (+ a 1)))))
+        (free! (mut screens))
+        (println "rescued {d} windows" (load moved))
+        (pool-pop pool)
+        (load moved))))

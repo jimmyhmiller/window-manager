@@ -1,0 +1,354 @@
+(module wm.persist)
+
+;;; Projects, pans, and window membership survive restarts in
+;;; ~/Library/Application Support/CoilWM/state.json (state-dev.json when
+;;; WM_ONLY_APP limits the run). A window from a previous
+;;; run is recognised by its CGWindowID when its app kept running, otherwise by
+;;; its app's bundle identifier and its title.
+
+(import "coil.primitive" :as primitive)
+(import "coil.alloc" :use [malloc-allocator])
+(import "coil.arraylist" :use [ArrayList])
+(import "coil.str" :use [from-cstr to-cstr])
+(import "coil.fs" :as fs)
+(import "coil.serde" :use *)
+(import "coil.serde.derive" :use *)
+(import "coil.serde.json" :use [to-json-str-indented from-json])
+(import "wm.objc" :use *)
+(import "wm.cocoa" :use *)
+(import "wm.ax" :as ax)
+(import "wm.model" :as model)
+(import "wm.tracker" :as tracker)
+(import "wm.canvas" :as canvas)
+(import "wm.pan" :as pan)
+
+(extern getenv :cc c [(ptr i8)] (-> (ptr i8)))
+
+(extern snprintf :cc c [(ptr i8) i64 (ptr i8) ...] (-> i32))
+
+(const STATE-VERSION 4)
+
+(const SAVE-SECONDS 2.0)
+
+(defstruct SavedProject [(name (slice u8))])
+
+(derive Serialize Deserialize SavedProject)
+
+;;; Project `project`'s pan on the display with CGDirectDisplayID `screen`.
+(defstruct SavedPan [(project i64) (screen i64) (x f64)])
+
+(derive Serialize Deserialize SavedPan)
+
+(defstruct SavedWindow
+  [(id i64)
+   (bundle (slice u8))
+   (title (slice u8))
+   (project i64)
+   (screen i64)
+   (x f64)
+   (y f64)])
+
+(derive Serialize Deserialize SavedWindow)
+
+(defstruct SavedState
+  [(version i64)
+   (active i64)
+   (mode i64)
+   (projects (ArrayList SavedProject))
+   (pans (ArrayList SavedPan))
+   (windows (ArrayList SavedWindow))])
+
+(derive Serialize Deserialize SavedState)
+
+(defstruct Persist
+  [(windows (ArrayList SavedWindow))
+   (claimed (ArrayList bool))])
+
+(defn persist [] (-> (ptr Persist))
+  (primitive/alloc-static Persist))
+
+;; ---- paths ----
+
+(defn dir-path [(buf (ptr i8)) (cap i64)] (-> (slice u8))
+  (do
+    (snprintf buf cap c"%s/Library/Application Support/CoilWM" (getenv c"HOME"))
+    (from-cstr buf)))
+
+;;; A run limited by WM_ONLY_APP keeps its own state, apart from the real one.
+(defn state-name [] (-> (ptr i8))
+  (if (nil? (getenv c"WM_ONLY_APP")) c"state" c"state-dev"))
+
+(defn state-path [(buf (ptr i8)) (cap i64)] (-> (slice u8))
+  (do
+    (snprintf buf
+              cap
+              c"%s/Library/Application Support/CoilWM/%s.json"
+              (getenv c"HOME")
+              (state-name))
+    (from-cstr buf)))
+
+(defn temp-path [(buf (ptr i8)) (cap i64)] (-> (slice u8))
+  (do
+    (snprintf buf
+              cap
+              c"%s/Library/Application Support/CoilWM/%s.json.tmp"
+              (getenv c"HOME")
+              (state-name))
+    (from-cstr buf)))
+
+;; ---- window identity ----
+
+;;; The bundle identifier of `pid`'s app, borrowed from an autoreleased string;
+;;; empty when it has none.
+(defn bundle-of [(pid i32)] (-> (slice u8))
+  (let [app
+          (msg (ptr i8)
+               (cls c"NSRunningApplication")
+               c"runningApplicationWithProcessIdentifier:"
+               [i32]
+               pid)
+        id (if (nil? app) (nil) (send app c"bundleIdentifier"))]
+    (if (nil? id) "" (from-cstr (nsstr-cstr id)))))
+
+;; ---- saving ----
+
+(defn snapshot [(a (dyn coil.alloc/Allocator))]
+  (-> SavedState)
+  (let [(mut projects) (ArrayList::new [SavedProject] a)
+        (mut pans) (ArrayList::new [SavedPan] a)
+        (mut windows) (ArrayList::new [SavedWindow] a)
+        (mut p) 0
+        (mut k) 0
+        (mut i) 0]
+    (do
+      (while (< p (model/project-count))
+        (let [pr (model/project p)]
+          (do
+            (push! (mut projects) (SavedProject :name (from-cstr (.name pr))))
+            (set! p (+ p 1)))))
+      (while (< k (model/pan-count))
+        (let [e (model/pan-entry k)]
+          (do
+            (push! (mut pans)
+                   (SavedPan
+                     :project (.project e)
+                     :screen (primitive/cast i64 (.screen e))
+                     :x (.x e)))
+            (set! k (+ k 1)))))
+      (while (< i (model/win-count))
+        (let [w (model/win i)]
+          (do
+            (push! (mut windows)
+                   (SavedWindow
+                     :id (primitive/cast i64 (.id w))
+                     :bundle (to-owned a (bundle-of (.pid w)))
+                     :title (if (nil? (.title w)) "" (from-cstr (.title w)))
+                     :project (.project w)
+                     :screen (primitive/cast i64 (.screen w))
+                     :x (.x (.canvas w))
+                     :y (.y (.canvas w))))
+            (set! i (+ i 1)))))
+      (SavedState
+        :version STATE-VERSION
+        :active (model/active)
+        :mode (match (pan/mode) (Direct [] 0) (Glide [] 1) (LiveGlide [] 2))
+        :projects projects
+        :pans pans
+        :windows windows))))
+
+;; the bundle string is autoreleased; copy it so it outlives this pass
+(defn to-owned [(a (dyn coil.alloc/Allocator)) (s (slice u8))] (-> (slice u8))
+  (from-cstr (to-cstr a s)))
+
+;;; Write the state file now (atomically, through a temporary file).
+(defn save! [] (-> i64)
+  (let [a (malloc-allocator)
+        pool (pool-push)
+        (mut dir) (zeroed (array i8 1024))
+        (mut path) (zeroed (array i8 1024))
+        (mut tmp) (zeroed (array i8 1024))
+        state (snapshot a)]
+    (do
+      (match (fs/create-dir a
+                            (dir-path (primitive/cast (ptr i8) (mut dir)) 1024)
+                            448)
+        (Ok [_] 0)
+        (Err [_] 0))
+      ; already exists; a real failure shows up when writing below
+      (try (let [json
+                   (try-or! (to-json-str-indented a state 2)
+                            (panic "persist: could not encode state"))]
+             (match (fs/write-file a
+                                   (temp-path (primitive/cast (ptr i8)
+                                                              (mut tmp))
+                                              1024)
+                                   json)
+               (Err [_] (do (println "[wm] could not write the state file") 0))
+               (Ok [_]
+                   (match (fs/rename-file a
+                                          (temp-path (primitive/cast (ptr i8)
+                                                                     (mut tmp))
+                                                     1024)
+                                          (state-path (primitive/cast (ptr i8)
+                                                                      (mut path))
+                                                      1024))
+                     (Err [_]
+                          (do
+                            (println "[wm] could not replace the state file")
+                            0))
+                     (Ok [_] 0))))))
+      (set! (.dirty (model/model)) false)
+      (pool-pop pool))))
+
+;; Saving waits until a pan ends.
+(defn on-save-tick [(self (ptr i8)) (cmd (ptr i8)) (timer (ptr i8))] (-> void)
+  (if (and (.dirty (model/model)) (not (model/interacting?))) (save!) 0))
+
+;;; The quit hook: save before exiting.
+(defn save-now [] (-> void)
+  (save!))
+
+;; ---- loading ----
+
+;;; Read the state file, if any: recreate its projects and active project, and
+;;; remember its windows for `claim`. Returns true when state was loaded.
+(defn load! [] (-> bool)
+  (let [a (malloc-allocator)
+        (mut path) (zeroed (array i8 1024))]
+    (do
+      (set! (.windows (persist)) (ArrayList::new [SavedWindow] a))
+      (set! (.claimed (persist)) (ArrayList::new [bool] a))
+      (try (let [bytes
+                   (try-or! (fs/read-file a
+                                          (state-path (primitive/cast (ptr i8)
+                                                                      (mut path))
+                                                      1024))
+                            false)]
+             (match (from-json [SavedState] a bytes)
+               (Err [_]
+                    (do
+                      (println "[wm] ignoring an unreadable state file")
+                      false))
+               (Ok [state]
+                   (if (or (!= (.version state) STATE-VERSION)
+                           (= (len (.projects state)) 0))
+                       false
+                       (let [(mut p) 0
+                             (mut i) 0]
+                         (do
+                           (while (< p (len (.projects state)))
+                             (let [sp (get (.projects state) p)]
+                               (do
+                                 (model/add-project! (to-cstr a (.name sp)))
+                                 (set! p (+ p 1)))))
+                           (set! (.active (model/model))
+                                 (if (and (>= (.active state) 0)
+                                          (< (.active state)
+                                             (model/project-count)))
+                                     (.active state)
+                                     0))
+                           (set! (.windows (persist)) (.windows state))
+                           (pan/set-mode! (case (.mode state)
+                                            0 (pan/Direct)
+                                            1 (pan/Glide)
+                                            (pan/LiveGlide)))
+                           (let [(mut k) 0]
+                             (while (< k (len (.pans state)))
+                               (let [e (get (.pans state) k)]
+                                 (do
+                                   (if (< (.project e) (model/project-count))
+                                       (model/set-pan! (.project e)
+                                                       (primitive/cast u32
+                                                                       (.screen e))
+                                                       (.x e))
+                                       0)
+                                   (set! k (+ k 1))))))
+                           (while (< i (len (.windows state)))
+                             (do
+                               (push! (mut (.claimed (persist))) false)
+                               (set! i (+ i 1))))
+                           (println "[wm] restored {d} projects, {d} remembered windows"
+                                    (model/project-count)
+                                    (len (.windows state)))
+                           true))))))))))
+
+(defn find-saved [(id u32) (bundle (slice u8)) (title (slice u8))] (-> i64)
+  (let [ws (.windows (persist))
+        (mut i) 0
+        (mut by-id) -1
+        (mut by-title) -1]
+    (do
+      (while (< i (len ws))
+        (let [s (get ws i)]
+          (do
+            (if (and (not (get (.claimed (persist)) i)) (= (.bundle s) bundle))
+                (do
+                  (if (and (< by-id 0) (= (.id s) (primitive/cast i64 id)))
+                      (set! by-id i)
+                      0)
+                  (if (and (< by-title 0) (= (.title s) title))
+                      (set! by-title i)
+                      0)
+                  0)
+                0)
+            (set! i (+ i 1)))))
+      (if (>= by-id 0) by-id by-title))))
+
+;;; Where a newly found window goes. A recognised window rejoins its project
+;;; and stays exactly where it is on screen; only one stranded at an edge
+;;; sliver goes back to its remembered canvas position. Anything else joins
+;;; the active project where it is.
+(defn claim [(id u32) (pid i32) (el (ptr i8)) (pos CGPoint) (size CGSize)]
+  (-> tracker/Claim)
+  (let [(mut title-buf) (zeroed (array i8 256))
+        has-title
+          (ax/title-cstr-into el (primitive/cast (ptr i8) (mut title-buf)) 256)
+        title
+          (if has-title
+              (from-cstr (primitive/cast (ptr i8) (mut title-buf)))
+              "")
+        found (find-saved id (bundle-of pid) title)]
+    (if (< found 0)
+        (tracker/claim-here id pid el pos size)
+        (let [s (get (.windows (persist)) found)
+              p
+                (if (< (.project s) (model/project-count))
+                    (.project s)
+                    (model/active))
+              si (model/screen-index-of pos size)
+              scr (model/screen-at (if (< si 0) 0 si))
+              saved-screen (primitive/cast u32 (.screen s))]
+          (do
+            (set! (mut (.claimed (persist))) found true)
+            (if (and (canvas/stashed-x? (.frame scr) (.edges scr) size pos)
+                     (>= (model/screen-index saved-screen) 0))
+                ;; left waiting at an edge: back to where it was on its canvas
+                (tracker/Claim
+                  :project p
+                  :screen saved-screen
+                  :canvas (CGPoint :x (.x s) :y (.y s)))
+                (let [w (model/place-here p pos size)]
+                  (tracker/Claim
+                    :project p
+                    :screen (.screen w)
+                    :canvas (.canvas w)))))))))
+
+;;; Save every few seconds while anything changed.
+(defn start-autosave! [] (-> i64)
+  (let [c (begin-class c"WMAutosave" c"NSObject")]
+    (do
+      (add-method c
+                  c"tick:"
+                  (primitive/cast (ptr i8) (fnptr-of on-save-tick))
+                  c"v@:@")
+      (finish-class c)
+      (msg (ptr i8)
+           (cls c"NSTimer")
+           c"scheduledTimerWithTimeInterval:target:selector:userInfo:repeats:"
+           [f64 (ptr i8) (ptr i8) (ptr i8) u8]
+           SAVE-SECONDS
+           (send (send c c"alloc") c"init")
+           (sel c"tick:")
+           (nil)
+           (primitive/cast u8 1))
+      0)))

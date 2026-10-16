@@ -1,0 +1,256 @@
+(module wm.menubar)
+
+;;; The menu bar icon: every project (the active one checked), New Project,
+;;; Reset Pan, the keyboard shortcuts, and Quit, which puts every window back
+;;; before exiting. The menu is rebuilt each time it opens.
+
+(import "coil.primitive" :as primitive)
+(import "wm.objc" :use *)
+(import "wm.cocoa" :use *)
+(import "wm.model" :as model)
+(import "wm.quit" :as quit)
+(import "wm.strip" :as strip)
+(import "wm.pan" :as pan)
+(import "wm.overlay" :as overlay)
+
+;; NSVariableStatusItemLength
+(const VARIABLE-LENGTH -1.0)
+
+;; NSEventModifierFlags
+(const MOD-SHIFT 131072)
+
+(const MOD-CONTROL 262144)
+
+(const MOD-OPTION 524288)
+
+(const MOD-COMMAND 1048576)
+
+;; NSControlStateValueOn / Off
+(const STATE-ON 1)
+
+(const STATE-OFF 0)
+
+(defn controller [] (-> (ptr (ptr i8)))
+  (primitive/alloc-static (ptr i8)))
+
+(defn add-item! [(menu (ptr i8))
+                 (title (ptr i8))
+                 (action (ptr i8))
+                 (key (ptr i8))
+                 (modifiers i64)
+                 (tag i64)] (-> (ptr i8))
+  (let [item
+          (msg (ptr i8)
+               (send (cls c"NSMenuItem") c"alloc")
+               c"initWithTitle:action:keyEquivalent:"
+               [(ptr i8) (ptr i8) (ptr i8)]
+               (nsstr title)
+               (if (nil? action) (nil) (sel action))
+               (nsstr key))]
+    (do
+      (msg void item c"setTarget:" [(ptr i8)] (load (controller)))
+      (msg void item c"setTag:" [i64] tag)
+      (msg void
+           item
+           c"setKeyEquivalentModifierMask:"
+           [u64]
+           (primitive/cast u64 modifiers))
+      (msg void menu c"addItem:" [(ptr i8)] item)
+      (send item c"release")
+      item)))
+
+(defn add-separator! [(menu (ptr i8))] (-> i64)
+  (do
+    (msg void
+         menu
+         c"addItem:"
+         [(ptr i8)]
+         (send (cls c"NSMenuItem") c"separatorItem"))
+    0))
+
+;;; A greyed-out line of explanation.
+(defn add-note! [(menu (ptr i8)) (text (ptr i8))] (-> i64)
+  (let [item (add-item! menu text (nil) c"" 0 0)]
+    (do (msg void item c"setEnabled:" [u8] (primitive/cast u8 0)) 0)))
+
+(defn digit-key [(p i64) (buf (ptr i8))] (-> (ptr i8))
+  (do
+    (set! buf (primitive/cast i8 (+ 49 p)))
+    (set! (index buf 1) (primitive/cast i8 0))
+    buf))
+
+(defn mode-item! [(menu (ptr i8)) (title (ptr i8)) (tag i64)] (-> i64)
+  (let [item (add-item! menu title c"setMode:" c"" 0 tag)]
+    (do
+      (msg void
+           item
+           c"setState:"
+           [i64]
+           (if (= tag (mode-tag)) STATE-ON STATE-OFF))
+      0)))
+
+;; NSMenuDelegate: refill the menu just before it opens.
+(defn menu-needs-update [(self (ptr i8)) (cmd (ptr i8)) (menu (ptr i8))]
+  (-> void)
+  (let [(mut key) (zeroed (array i8 2))
+        (mut p) 0]
+    (do
+      (msg void menu c"removeAllItems" [])
+      (add-note! menu c"Projects")
+      (while (< p (model/project-count))
+        (let [item
+                (add-item! menu
+                           (model/project-name p)
+                           c"switchProject:"
+                           (if (< p 9)
+                               (digit-key p (primitive/cast (ptr i8) (mut key)))
+                               c"")
+                           (+ MOD-CONTROL MOD-OPTION)
+                           p)]
+          (do
+            (msg void
+                 item
+                 c"setState:"
+                 [i64]
+                 (if (= p (model/active)) STATE-ON STATE-OFF))
+            (set! p (+ p 1)))))
+      (add-separator! menu)
+      (add-item! menu
+                 c"New Project"
+                 c"newProject:"
+                 c"n"
+                 (+ MOD-CONTROL MOD-OPTION)
+                 0)
+      (add-item! menu
+                 c"Reset Pan"
+                 c"resetPan:"
+                 c"0"
+                 (+ MOD-CONTROL MOD-OPTION)
+                 0)
+      (add-separator! menu)
+      (add-note! menu c"Panning")
+      (if (overlay/denied?)
+          (do
+            (add-item! menu
+                       c"⚠︎ Glide needs Screen Recording permission…"
+                       c"openPrivacy:"
+                       c""
+                       0
+                       0)
+            0)
+          0)
+      (mode-item! menu c"Direct — the real windows move" 0)
+      (mode-item! menu c"Glide — pictures move, windows follow" 1)
+      (mode-item! menu c"Live Glide — live pictures move" 2)
+      (add-separator! menu)
+      (add-note! menu c"Pan sideways: ⌘ + two-finger scroll")
+      (add-note! menu c"Send focused window to a project: ⌃⌥⇧1–9")
+      (add-note! menu c"Rename or delete: right-click a project on the desktop")
+      (add-separator! menu)
+      (add-item! menu c"Quit (puts every window back)" c"quit:" c"" 0 0)
+      0)))
+
+(defn tag-of [(sender (ptr i8))] (-> i64)
+  (msg i64 sender c"tag" []))
+
+(defn on-switch [(self (ptr i8)) (cmd (ptr i8)) (sender (ptr i8))] (-> void)
+  (model/switch! (tag-of sender)))
+
+(defn on-new [(self (ptr i8)) (cmd (ptr i8)) (sender (ptr i8))] (-> void)
+  (let [(mut buf) (zeroed (array i8 64))
+        p
+          (model/add-project! (model/untitled-name (primitive/cast (ptr i8)
+                                                                   (mut buf))
+                                                   64))]
+    (do
+      (model/switch! p)
+      (strip/begin-rename! p))))
+
+(defn on-reset [(self (ptr i8)) (cmd (ptr i8)) (sender (ptr i8))] (-> void)
+  (let [(mut i) 0]
+    (while (< i (model/screen-count))
+      (do
+        (model/reset-pan! (.id (model/screen-at i)))
+        (set! i (+ i 1))))))
+
+(defn on-mode [(self (ptr i8)) (cmd (ptr i8)) (sender (ptr i8))] (-> void)
+  (do
+    (pan/set-mode! (case (tag-of sender)
+                     0 (pan/Direct)
+                     1 (pan/Glide)
+                     (pan/LiveGlide)))
+    (set! (.dirty (model/model)) true)))
+
+;; Open System Settings at Privacy & Security → Screen Recording.
+(defn on-open-privacy [(self (ptr i8)) (cmd (ptr i8)) (sender (ptr i8))]
+  (-> void)
+  (msg u8
+       (send (cls c"NSWorkspace") c"sharedWorkspace")
+       c"openURL:"
+       [(ptr i8)]
+       (msg (ptr i8)
+            (cls c"NSURL")
+            c"URLWithString:"
+            [(ptr i8)]
+            (nsstr c"x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture"))))
+
+(defn mode-tag [] (-> i64)
+  (match (pan/mode)
+    (Direct [] 0)
+    (Glide [] 1)
+    (LiveGlide [] 2)))
+
+(defn on-quit [(self (ptr i8)) (cmd (ptr i8)) (sender (ptr i8))] (-> void)
+  (quit/quit-now (nil)))
+
+;;; Put the icon in the menu bar.
+(defn show! [] (-> i64)
+  (let [c (begin-class c"WMMenuController" c"NSObject")]
+    (do
+      (add-method c
+                  c"menuNeedsUpdate:"
+                  (primitive/cast (ptr i8) (fnptr-of menu-needs-update))
+                  c"v@:@")
+      (add-method c
+                  c"switchProject:"
+                  (primitive/cast (ptr i8) (fnptr-of on-switch))
+                  c"v@:@")
+      (add-method c
+                  c"newProject:"
+                  (primitive/cast (ptr i8) (fnptr-of on-new))
+                  c"v@:@")
+      (add-method c
+                  c"resetPan:"
+                  (primitive/cast (ptr i8) (fnptr-of on-reset))
+                  c"v@:@")
+      (add-method c
+                  c"setMode:"
+                  (primitive/cast (ptr i8) (fnptr-of on-mode))
+                  c"v@:@")
+      (add-method c
+                  c"openPrivacy:"
+                  (primitive/cast (ptr i8) (fnptr-of on-open-privacy))
+                  c"v@:@")
+      (add-method c
+                  c"quit:"
+                  (primitive/cast (ptr i8) (fnptr-of on-quit))
+                  c"v@:@")
+      (finish-class c)
+      (set! (controller) (send (send c c"alloc") c"init"))
+      (let [item
+              (msg (ptr i8)
+                   (send (cls c"NSStatusBar") c"systemStatusBar")
+                   c"statusItemWithLength:"
+                   [f64]
+                   VARIABLE-LENGTH)
+            image (symbol c"rectangle.3.group" 15.0 (weight-regular))
+            menu (send (send (cls c"NSMenu") c"alloc") c"init")]
+        (do
+          (send item c"retain")
+          (msg void image c"setTemplate:" [u8] (primitive/cast u8 1))
+          (msg void (send item c"button") c"setImage:" [(ptr i8)] image)
+          (msg void menu c"setDelegate:" [(ptr i8)] (load (controller)))
+          (msg void menu c"setAutoenablesItems:" [u8] (primitive/cast u8 0))
+          (msg void item c"setMenu:" [(ptr i8)] menu)
+          (send menu c"release")
+          0)))))

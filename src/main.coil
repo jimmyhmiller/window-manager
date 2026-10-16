@@ -1,0 +1,69 @@
+(module wm.main)
+(import "coil.primitive" :as primitive)
+(import "wm.objc" :use *)
+(import "wm.ax" :as ax)
+(import "wm.capture" :as capture)
+(import "wm.mover" :as mover)
+(import "wm.model" :as model)
+(import "wm.tracker" :as tracker)
+(import "wm.input" :as input)
+(import "wm.quit" :as quit)
+(import "wm.strip" :as strip)
+(import "wm.persist" :as persist)
+(import "wm.menubar" :as menubar)
+(import "wm.watchdog" :as watchdog)
+(import "wm.pan" :as pan)
+(import "wm.overlay" :as overlay)
+(import "wm.peek" :as peek)
+
+;; NSApplicationActivationPolicyAccessory: no Dock icon, no menu bar.
+(const ACTIVATION-POLICY-ACCESSORY 1)
+
+(extern CGPreflightScreenCaptureAccess :cc c [] (-> u8))
+
+(extern CGRequestScreenCaptureAccess :cc c [] (-> u8))
+
+;; Projects, membership, or the active project changed.
+(defn model-changed [] (-> void)
+  (do
+    (strip/model-changed)
+    (overlay/invalidate-backgrounds!)
+    (peek/update!)))
+
+(defn main [(argc i32) (argv (ptr (ptr i8)))] (-> i64)
+  (cond (not (watchdog/worker?)) (watchdog/supervise! argv)
+        (not (ax/trusted?))
+          (do
+            (println "wm needs Accessibility permission (System Settings → Privacy & Security → Accessibility)")
+            1)
+        :else
+          (let [pool (pool-push)
+                app (send (cls c"NSApplication") c"sharedApplication")]
+            (do
+              (msg u8
+                   app
+                   c"setActivationPolicy:"
+                   [i64]
+                   ACTIVATION-POLICY-ACCESSORY)
+              (capture/init!)
+              (ax/init!)
+              (mover/init!)
+              (model/init!)
+              (pan/init!)
+              (overlay/init!)
+              (peek/init! (fnptr-of pan/step!))
+              (if (persist/load!) 0 (model/add-project! c"Main"))
+              (model/on-change! (fnptr-of model-changed))
+              (strip/show! (strip/Left))
+              (menubar/show!)
+              (tracker/start! (fnptr-of persist/claim))
+              ;; asks once; the menu explains if it is declined
+              (if (= (CGPreflightScreenCaptureAccess) (primitive/cast u8 0))
+                  (do (CGRequestScreenCaptureAccess) 0)
+                  0)
+              (input/start!)
+              (quit/install! (fnptr-of persist/save-now))
+              (persist/start-autosave!)
+              (pool-pop pool)
+              (msg void app c"run" [])
+              0))))

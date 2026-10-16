@@ -1,0 +1,1173 @@
+(module wm.overlay)
+
+;;; Pictures for Glide and Live Glide. While a pan is live, an overlay window
+;;; covers the screen: a picture of the desktop without the active project's
+;;; windows, and on it one picture per window, front to back. The pan moves the
+;;; pictures as a single layer every frame, so it is as smooth as the display;
+;;; the overlay is exactly the size of its screen, so nothing ever shows on
+;;; another display. The real windows catch up underneath; when the gesture
+;;; ends the overlay fades out over them.
+;;;
+;;; Pictures come from a cache kept fresh in the background, so a gesture
+;;; starts instantly. The cache is gentle on the system's capture service:
+;;; one capture at a time, a few per second at most, windows round-robin and
+;;; desktops rarely. Live Glide also streams each window while the pan is
+;;; live, so their contents keep updating.
+
+(import "coil.primitive" :as primitive)
+(import "coil.alloc" :use [malloc-allocator box! destroy])
+(import "coil.arraylist" :use [ArrayList])
+(import "coil.str" :use [from-cstr])
+(import "wm.objc" :use *)
+(import "wm.cocoa" :use *)
+(import "wm.ax" :as ax)
+(import "wm.model" :as model)
+(import "wm.winlist" :as winlist)
+(import "wm.clock" :use [now-ms])
+(import "wm.list" :use [remove-swap!])
+
+(extern CGImageRetain :cc c [(ptr i8)] (-> (ptr i8)))
+
+(extern CGImageRelease :cc c [(ptr i8)] (-> void))
+
+(extern CGPathCreateWithRoundedRect
+        :cc
+        c
+        [CGRect f64 f64 (ptr i8)]
+        (-> (ptr i8)))
+
+(extern CGPathRelease :cc c [(ptr i8)] (-> void))
+
+(extern CMSampleBufferGetImageBuffer :cc c [(ptr i8)] (-> (ptr i8)))
+
+(extern CVPixelBufferGetIOSurface :cc c [(ptr i8)] (-> (ptr i8)))
+
+(extern dispatch_queue_create :cc c [(ptr i8) (ptr i8)] (-> (ptr i8)))
+
+(extern dispatch_time :cc c [u64 i64] (-> u64))
+
+(extern dispatch_after_f
+        :cc
+        c
+        [u64 (ptr u8) (ptr i8) (fnptr c [(ptr i8)] void)]
+        (-> void))
+
+(extern malloc :cc c [u64] (-> (ptr i8)))
+
+(extern free :cc c [(ptr i8)] (-> void))
+
+;; CGWindowLevelKey for the Dock. The overlay sits just below the Dock, so the
+;; Dock stays in front of window pictures exactly as it stays in front of
+;; windows (and the menu bar, above the Dock, does too).
+(const WINDOW-LEVEL-KEY-DOCK 7)
+
+(const STYLE-NONACTIVATING-PANEL 128)
+
+(const BACKING-BUFFERED 2)
+
+;; canJoinAllSpaces | stationary | ignoresCycle
+(const COLLECTION-BEHAVIOR 81)
+
+(const FADE-SECONDS 0.12)
+
+(const FADE-NS 120000000)
+
+;; Approximates the shadow macOS draws around a window.
+(const SHADOW-OPACITY 0.38)
+
+(const SHADOW-RADIUS 22.0)
+
+(const SHADOW-OFFSET -12.0)
+
+(const CORNER-RADIUS 16.0)
+
+;; SCStreamOutputTypeScreen; kCVPixelFormatType_32BGRA
+(const OUTPUT-SCREEN 0)
+
+(const PIXEL-BGRA 1111970369)
+
+;;; A cached picture: of window `id`, or (with `display` set) of display
+;;; `display`'s desktop without the active project's windows.
+(defstruct Picture [(id u32) (display u32) (image (ptr i8)) (taken-ms i64)])
+
+;;; One window's picture in the live overlay, and its stream in Live Glide.
+(defstruct Proxy [(id u32) (layer (ptr i8)) (stream (ptr i8)) (frame (ptr i8))])
+
+;;; A capture: of window `id`, or (id 0) of display `display`'s desktop.
+(defstruct Job [(id u32) (display u32)])
+
+(defstruct Overlay
+  [(window (ptr i8))
+   (host (ptr i8))
+   (background (ptr i8))
+   (container (ptr i8))
+   (proxies (ArrayList Proxy))
+   (pictures (ArrayList Picture))
+   (live bool)
+   (showing bool)
+   (generation i64)
+   (screen u32)
+   ;; the background cache
+   (listing (ptr i8))
+   (listing-ms i64)
+   (listing-pending bool)
+   (in-flight bool)
+   (in-flight-job Job)
+   (in-flight-ms i64)
+   (ticket i64)
+   (listing-ms-asked i64)
+   (cursor i64)
+   (backgrounds-changed-ms i64)
+   (pending (ptr i8))
+   (denied bool)
+   (output (ptr i8))
+   (queue (ptr i8))
+   (retired (ArrayList (ptr i8)))])
+
+(defn state [] (-> (ptr Overlay))
+  (primitive/alloc-static Overlay))
+
+(defn no-actions [] (-> i64)
+  (do
+    (msg void (cls c"CATransaction") c"begin" [])
+    (msg void
+         (cls c"CATransaction")
+         c"setDisableActions:"
+         [u8]
+         (primitive/cast u8 1))
+    0))
+
+(defn commit [] (-> i64)
+  (do (msg void (cls c"CATransaction") c"commit" []) 0))
+
+;; ---- the picture cache ----
+
+(defn picture-index [(id u32) (display u32)] (-> i64)
+  (let [(mut i) 0
+        (mut found) -1]
+    (do
+      (while (and (< i (len (.pictures (state)))) (< found 0))
+        (let [p (get (.pictures (state)) i)]
+          (do
+            (if (and (= (.id p) id) (= (.display p) display)) (set! found i) 0)
+            (set! i (+ i 1)))))
+      found)))
+
+;;; Store a picture (taking ownership of `image`, which may be null).
+(defn put-picture! [(id u32) (display u32) (image (ptr i8))] (-> i64)
+  (if (nil? image)
+      0
+      (let [i (picture-index id display)]
+        (if (< i 0)
+            (push! (mut (.pictures (state)))
+                   (Picture
+                     :id id
+                     :display display
+                     :image image
+                     :taken-ms (now-ms)))
+            (do
+              (CGImageRelease (.image (get (.pictures (state)) i)))
+              (set! (mut (.pictures (state)))
+                    i
+                    (Picture
+                      :id id
+                      :display display
+                      :image image
+                      :taken-ms (now-ms))))))))
+
+;;; How long ago a picture was taken, or -1 when there is none.
+(defn picture-age [(id u32) (display u32)] (-> i64)
+  (let [i (picture-index id display)]
+    (if (< i 0) -1 (- (now-ms) (.taken-ms (get (.pictures (state)) i))))))
+
+(defn picture-of [(id u32) (display u32)] (-> (ptr i8))
+  (let [i (picture-index id display)]
+    (if (< i 0) (nil) (.image (get (.pictures (state)) i)))))
+
+(defn scale-of [(display u32)] (-> f64)
+  (let [screens (send (cls c"NSScreen") c"screens")
+        n (msg i64 screens c"count" [])
+        (mut i) 0
+        (mut scale) 2.0]
+    (do
+      (while (< i n)
+        (let [s
+                (msg (ptr i8)
+                     screens
+                     c"objectAtIndex:"
+                     [u64]
+                     (primitive/cast u64 (load i)))]
+          (do
+            (if (= (model/display-id s) display)
+                (set! scale (backing-scale s))
+                0)
+            (set! i (+ i 1)))))
+      scale)))
+
+(defn sc-window [(content (ptr i8)) (id u32)] (-> (ptr i8))
+  (let [windows (send content c"windows")
+        n (msg i64 windows c"count" [])
+        (mut i) 0
+        (mut found) (nil)]
+    (do
+      (while (and (< i n) (nil? found))
+        (let [w
+                (msg (ptr i8)
+                     windows
+                     c"objectAtIndex:"
+                     [u64]
+                     (primitive/cast u64 (load i)))]
+          (do
+            (if (= (msg u32 w c"windowID" []) id) (set! found w) 0)
+            (set! i (+ i 1)))))
+      found)))
+
+(defn sc-display [(content (ptr i8)) (id u32)] (-> (ptr i8))
+  (let [displays (send content c"displays")
+        n (msg i64 displays c"count" [])
+        (mut i) 0
+        (mut found) (nil)]
+    (do
+      (while (and (< i n) (nil? found))
+        (let [d
+                (msg (ptr i8)
+                     displays
+                     c"objectAtIndex:"
+                     [u64]
+                     (primitive/cast u64 (load i)))]
+          (do
+            (if (= (msg u32 d c"displayID" []) id) (set! found d) 0)
+            (set! i (+ i 1)))))
+      found)))
+
+;;; The active project's windows on `display`, as SCWindows (autoreleased array).
+(defn project-sc-windows [(content (ptr i8)) (display u32)] (-> (ptr i8))
+  (let [out (send (cls c"NSMutableArray") c"array")
+        (mut i) 0]
+    (do
+      (while (< i (model/win-count))
+        (let [w (model/win i)]
+          (do
+            (if (and (= (.project w) (model/active))
+                     (= (.screen w) display)
+                     (not (.minimized w)))
+                (let [sw (sc-window content (.id w))]
+                  (if (nil? sw)
+                      0
+                      (do (msg void out c"addObject:" [(ptr i8)] sw) 0)))
+                0)
+            (set! i (+ i 1)))))
+      out)))
+
+;; ---- keeping the cache fresh ----
+
+;; The scheduler runs this often and starts at most one capture per run.
+(const TICK-SECONDS 0.25)
+
+;; A window list from ScreenCaptureKit is reused for this long.
+(const LISTING-MS 5000)
+
+;; Window pictures older than this are retaken, one window at a time.
+(const WINDOW-STALE-MS 2000)
+
+;; Desktop pictures change little; they are retaken this rarely.
+(const BACKGROUND-STALE-MS 15000)
+
+;; A capture or window list not answered within this is abandoned; a late
+;; answer is recognised by its ticket and dropped.
+(const ANSWER-TIMEOUT-MS 4000)
+
+;;; Screens that hold any of the active project's windows; only those need a
+;;; desktop picture, since only their pans show pictures.
+(defn screen-has-windows? [(display u32)] (-> bool)
+  (let [(mut i) 0
+        (mut found) false]
+    (do
+      (while (and (< i (model/win-count)) (not found))
+        (let [w (model/win i)]
+          (do
+            (if (and (= (.project w) (model/active))
+                     (= (.screen w) display)
+                     (not (.minimized w)))
+                (set! found true)
+                0)
+            (set! i (+ i 1)))))
+      found)))
+
+;;; Desktop pictures are retaken soon after the active project changes, since
+;;; the windows left out of them changed.
+(defn invalidate-backgrounds! [] (-> i64)
+  (do (set! (.backgrounds-changed-ms (state)) (now-ms)) 0))
+
+(defn wanted-window? [(w model/Win)] (-> bool)
+  (and (= (.project w) (model/active)) (not (.minimized w))))
+
+;;; The next capture worth taking, if any: missing pictures first, then stale
+;;; desktops, then the stalest window picture.
+(defn next-job [] (-> (Option Job))
+  (let [(mut found) (None [Job])
+        (mut s) 0
+        (mut i) 0
+        n (model/win-count)]
+    (do
+      ;; a screen with windows but no desktop picture
+      (while (and (< s (model/screen-count))
+                  (match found (None [] true) (Some [_] false)))
+        (let [d (.id (model/screen-at s))]
+          (do
+            (if (and (screen-has-windows? d)
+                     (< (picture-age (primitive/cast u32 0) d) 0))
+                (set! found (Some (Job :id (primitive/cast u32 0) :display d)))
+                0)
+            (set! s (+ s 1)))))
+      ;; a window with no picture
+      (while (and (< i n) (match found (None [] true) (Some [_] false)))
+        (let [w (model/win i)]
+          (do
+            (if (and (wanted-window? w)
+                     (< (picture-age (.id w) (primitive/cast u32 0)) 0))
+                (set! found
+                      (Some (Job :id (.id w) :display (primitive/cast u32 0))))
+                0)
+            (set! i (+ i 1)))))
+      ;; a stale desktop
+      (set! s 0)
+      (while (and (< s (model/screen-count))
+                  (match found (None [] true) (Some [_] false)))
+        (let [d (.id (model/screen-at s))
+              age (picture-age (primitive/cast u32 0) d)]
+          (do
+            (if (and (screen-has-windows? d)
+                     ;; taken before the last change, or simply old
+                     (or (> age (- (now-ms) (.backgrounds-changed-ms (state))))
+                         (> age BACKGROUND-STALE-MS)))
+                (set! found (Some (Job :id (primitive/cast u32 0) :display d)))
+                0)
+            (set! s (+ s 1)))))
+      ;; round-robin over stale window pictures
+      (set! i 0)
+      (while (and (< i n) (match found (None [] true) (Some [_] false)))
+        (let [k (% (+ (.cursor (state)) i) n)
+              w (model/win k)]
+          (do
+            (if (and (wanted-window? w)
+                     (> (picture-age (.id w) (primitive/cast u32 0))
+                        WINDOW-STALE-MS))
+                (do
+                  (set! (.cursor (state)) (+ k 1))
+                  (set! found
+                        (Some (Job :id (.id w) :display (primitive/cast u32 0))))
+                  0)
+                0)
+            (set! i (+ i 1)))))
+      (load found))))
+
+;;; Called every TICK-SECONDS: refresh the window list when it is old, else
+;;; start one capture if one is worth taking. Never while a pan is live or the
+;;; overlay is up (it must never be in a picture).
+(defn tick! [] (-> i64)
+  (cond (or (.showing (state))
+            (!= (msg u8 (.window (state)) c"isVisible" [])
+                (primitive/cast u8 0))
+            (model/interacting?))
+          0
+        (.listing-pending (state))
+          (if (> (- (now-ms) (.listing-ms-asked (state))) ANSWER-TIMEOUT-MS)
+              (do
+                (if (debug?)
+                    (do
+                      (println "[overlay] window list request abandoned (no answer)")
+                      0)
+                    0)
+                (set! (.ticket (state)) (+ (.ticket (state)) 1))
+                (set! (.listing-pending (state)) false)
+                0)
+              0)
+        (.in-flight (state))
+          (if (> (- (now-ms) (.in-flight-ms (state))) ANSWER-TIMEOUT-MS)
+              (do
+                (if (debug?)
+                    (do
+                      (println "[overlay] capture abandoned (no answer): window {d} display {d}"
+                               (primitive/cast i64
+                                               (.id (.in-flight-job (state))))
+                               (primitive/cast i64
+                                               (.display (.in-flight-job (state)))))
+                      0)
+                    0)
+                (set! (.ticket (state)) (+ (.ticket (state)) 1))
+                (set! (.in-flight (state)) false)
+                0)
+              0)
+        (or (nil? (.listing (state)))
+            (> (- (now-ms) (.listing-ms (state))) LISTING-MS))
+          (let [(mut b) (zeroed TicketBlock)]
+            (do
+              (set! (.ticket (state)) (+ (.ticket (state)) 1))
+              (set! (.listing-pending (state)) true)
+              (set! (.listing-ms-asked (state)) (now-ms))
+              (msg void
+                   (cls c"SCShareableContent")
+                   c"getShareableContentWithCompletionHandler:"
+                   [(ptr i8)]
+                   (ticket-block (mut b)
+                                 (primitive/cast (ptr i8)
+                                                 (fnptr-of listing-arrived))
+                                 (.ticket (state))))
+              0))
+        :else
+          (match (next-job)
+            (None [] 0)
+            (Some [job] (start-capture! job)))))
+
+;;; An answer from ScreenCaptureKit, handed to the main thread with the
+;;; ticket of the request it answers.
+(defstruct Answer [(ticket i64) (object (ptr i8))])
+
+(defn send-answer [(ticket i64)
+                   (object (ptr i8))
+                   (to (fnptr c [(ptr i8)] void))] (-> void)
+  (let [a
+          (primitive/cast (ptr Answer)
+                          (malloc (primitive/cast u64 (sizeof Answer))))]
+    (do
+      (set! (.ticket a) ticket)
+      (set! (.object a) object)
+      (dispatch_async_f (primitive/linker-address _dispatch_main_q)
+                        (primitive/cast (ptr i8) a)
+                        to))))
+
+;; ScreenCaptureKit queue
+(defn listing-arrived [(block (ptr i8)) (content (ptr i8)) (error (ptr i8))]
+  (-> void)
+  (send-answer (block-ticket block)
+               (if (nil? content) (nil) (send content c"retain"))
+               (fnptr-of listing-ready)))
+
+;; main thread
+(defn listing-ready [(ctx (ptr i8))] (-> void)
+  (let [a (primitive/cast (ptr Answer) ctx)
+        content (.object a)
+        current
+          (and (.listing-pending (state)) (= (.ticket a) (.ticket (state))))]
+    (do
+      (free ctx)
+      (if current
+          (do
+            ;; no listing at all means Screen Recording permission is missing
+            (set! (.denied (state)) (nil? content))
+            (set! (.listing-pending (state)) false)
+            0)
+          0)
+      (if (not current)
+          (do (if (nil? content) 0 (do (send content c"release") 0)) 0)
+          (if (nil? content)
+              (do
+                (if (debug?)
+                    (do
+                      (println "[overlay] no window list from ScreenCaptureKit (Screen Recording permission?)")
+                      0)
+                    0)
+                0)
+              (do
+                (if (nil? (.listing (state)))
+                    0
+                    (do (send (.listing (state)) c"release") 0))
+                (set! (.listing (state)) content)
+                (set! (.listing-ms (state)) (now-ms))
+                ;; streams stopped by an earlier pan are released well after they stopped
+                (let [(mut i) 0]
+                  (while (< i (len (.retired (state))))
+                    (do
+                      (send (get (.retired (state)) i) c"release")
+                      (set! i (+ i 1)))))
+                (clear! (mut (.retired (state))))
+                0))))))
+
+(defn capture-config [(w f64) (h f64) (scale f64)] (-> (ptr i8))
+  (let [config (send (cls c"SCStreamConfiguration") c"new")]
+    (do
+      (msg void config c"setWidth:" [u64] (primitive/cast u64 (* w scale)))
+      (msg void config c"setHeight:" [u64] (primitive/cast u64 (* h scale)))
+      (msg void config c"setShowsCursor:" [u8] (primitive/cast u8 0))
+      (msg void
+           config
+           c"setIgnoreShadowsSingleWindow:"
+           [u8]
+           (primitive/cast u8 1))
+      (msg void config c"setPixelFormat:" [u32] (primitive/cast u32 PIXEL-BGRA))
+      config)))
+
+;;; The filter for `job` (+1), or null when its window or display is not in
+;;; the current window list.
+(defn job-filter [(job Job)] (-> (ptr i8))
+  (let [content (.listing (state))]
+    (if (= (.id job) (primitive/cast u32 0))
+        (let [d (sc-display content (.display job))]
+          (if (nil? d)
+              (nil)
+              (msg (ptr i8)
+                   (send (cls c"SCContentFilter") c"alloc")
+                   c"initWithDisplay:excludingWindows:"
+                   [(ptr i8) (ptr i8)]
+                   d
+                   (project-sc-windows content (.display job)))))
+        (let [w (sc-window content (.id job))]
+          (if (nil? w)
+              (nil)
+              (msg (ptr i8)
+                   (send (cls c"SCContentFilter") c"alloc")
+                   c"initWithDesktopIndependentWindow:"
+                   [(ptr i8)]
+                   w))))))
+
+(defn job-config [(job Job)] (-> (ptr i8))
+  (if (= (.id job) (primitive/cast u32 0))
+      (let [f (.frame (model/screen-at (model/screen-index (.display job))))]
+        (capture-config (.w f) (.h f) (scale-of (.display job))))
+      (let [w (model/win (model/index-of-id (.id job)))]
+        (capture-config (.w (.size w)) (.h (.size w)) (scale-of (.screen w))))))
+
+(defn start-capture! [(job Job)] (-> i64)
+  (let [filter (job-filter job)]
+    (if (nil? filter)
+        ;; not in the current list (a new window): get a fresh list next time
+        (do (set! (.listing-ms (state)) 0) 0)
+        (let [config (job-config job)]
+          (let [(mut b) (zeroed TicketBlock)]
+            (do
+              (set! (.ticket (state)) (+ (.ticket (state)) 1))
+              (set! (.in-flight (state)) true)
+              (set! (.in-flight-job (state)) job)
+              (set! (.in-flight-ms (state)) (now-ms))
+              (msg void
+                   (cls c"SCScreenshotManager")
+                   c"captureImageWithFilter:configuration:completionHandler:"
+                   [(ptr i8) (ptr i8) (ptr i8)]
+                   filter
+                   config
+                   (ticket-block (mut b)
+                                 (primitive/cast (ptr i8)
+                                                 (fnptr-of image-arrived))
+                                 (.ticket (state))))
+              (send filter c"release")
+              (send config c"release")
+              0))))))
+
+;; ScreenCaptureKit queue
+(defn image-arrived [(block (ptr i8)) (image (ptr i8)) (error (ptr i8))]
+  (-> void)
+  (send-answer (block-ticket block)
+               (if (nil? image) (nil) (CGImageRetain image))
+               (fnptr-of image-ready)))
+
+;; main thread
+(defn image-ready [(ctx (ptr i8))] (-> void)
+  (let [a (primitive/cast (ptr Answer) ctx)
+        image (.object a)
+        ticket (.ticket a)
+        job (.in-flight-job (state))]
+    (do
+      (free ctx)
+      (if (and (.in-flight (state)) (= ticket (.ticket (state))))
+          (do
+            (if (and (debug?) (nil? image))
+                (do
+                  (println "[overlay] capture failed for window {d} display {d}"
+                           (primitive/cast i64 (.id job))
+                           (primitive/cast i64 (.display job)))
+                  0)
+                0)
+            (put-picture! (.id job) (.display job) image)
+            (set! (.in-flight (state)) false)
+            0)
+          ;; the answer to an abandoned capture
+          (do (if (nil? image) 0 (do (CGImageRelease image) 0)) 0)))))
+
+(defn on-refresh-tick [(self (ptr i8)) (cmd (ptr i8)) (timer (ptr i8))]
+  (-> void)
+  (tick!))
+
+;;; True when ScreenCaptureKit refuses to capture (no Screen Recording
+;;; permission): Glide and Live Glide can only move the real windows.
+(defn denied? [] (-> bool)
+  (.denied (state)))
+
+;; ---- the overlay ----
+
+;;; Ready when the desktop picture and every window picture for `screen` are
+;;; cached; otherwise this gesture should move the real windows directly.
+(defn ready? [(screen u32)] (-> bool)
+  (let [(mut i) 0
+        (mut ok) (not (nil? (picture-of (primitive/cast u32 0) screen)))]
+    (do
+      (while (and ok (< i (model/win-count)))
+        (let [w (model/win i)]
+          (do
+            (if (and (= (.project w) (model/active))
+                     (= (.screen w) screen)
+                     (not (.minimized w))
+                     (nil? (picture-of (.id w) (primitive/cast u32 0))))
+                (set! ok false)
+                0)
+            (set! i (+ i 1)))))
+      ok)))
+
+(defn clear-proxies! [] (-> i64)
+  (let [(mut i) 0]
+    (do
+      (while (< i (len (.proxies (state))))
+        (let [p (get (.proxies (state)) i)]
+          (do
+            (msg void (.layer p) c"removeFromSuperlayer" [])
+            (if (nil? (.frame p)) 0 (do (ax/release (.frame p)) 0))
+            (set! i (+ i 1)))))
+      (clear! (mut (.proxies (state)))))))
+
+;;; The overlay's layers have their origin at the screen's bottom-left (AppKit
+;;; does not honour geometryFlipped on a hosting view's layer, so this is done
+;;; by hand): the layer y of something whose top is at global `top` and whose
+;;; height is `h`.
+(defn layer-y [(scr model/Screen) (top f64) (h f64)] (-> f64)
+  (- (.h (.frame scr)) (+ (- top (.y (.frame scr))) h)))
+
+;;; A picture of window `w` at its true place for the pan, in overlay
+;;; coordinates.
+(defn make-proxy! [(w model/Win) (scr model/Screen)] (-> i64)
+  (let [layer (new-layer)
+        x
+          (- (- (.x (.canvas w)) (model/pan-of (.project w) (.screen w)))
+             (.x (.frame scr)))
+        y (layer-y scr (.y (.canvas w)) (.h (.size w)))
+        bounds (rect 0.0 0.0 (.w (.size w)) (.h (.size w)))
+        path
+          (CGPathCreateWithRoundedRect bounds CORNER-RADIUS CORNER-RADIUS (nil))]
+    (do
+      (msg void
+           layer
+           c"setFrame:"
+           [CGRect]
+           (rect x y (.w (.size w)) (.h (.size w))))
+      (msg void
+           layer
+           c"setContents:"
+           [(ptr i8)]
+           (picture-of (.id w) (primitive/cast u32 0)))
+      (msg void layer c"setContentsScale:" [f64] (scale-of (.screen w)))
+      (msg void layer c"setShadowPath:" [(ptr i8)] path)
+      (CGPathRelease path)
+      (layer-shadow! layer
+                     (primitive/cast f32 SHADOW-OPACITY)
+                     SHADOW-RADIUS
+                     SHADOW-OFFSET)
+      (layer-add! (.container (state)) layer)
+      (push! (mut (.proxies (state)))
+             (Proxy
+               :id (.id w)
+               :layer layer
+               :stream (nil)
+               :frame (nil))))))
+
+;;; Pictures of the active project's windows on `scr`, back to front.
+(defn build-proxies! [(scr model/Screen)] (-> i64)
+  (let [(mut order) (ArrayList::new [u32] (malloc-allocator))
+        (mut k) 0]
+    (do
+      (winlist/front-to-back! (mut order))
+      ;; windows the window server does not list (minimized, other spaces) go first, at the back
+      (let [(mut i) 0]
+        (while (< i (model/win-count))
+          (let [w (model/win i)]
+            (do
+              (if (and (= (.project w) (model/active))
+                       (= (.screen w) (.id scr))
+                       (not (.minimized w))
+                       (not (listed? (load order) (.id w))))
+                  (make-proxy! w scr)
+                  0)
+              (set! i (+ i 1))))))
+      (set! k (- (len order) 1))
+      (while (>= k 0)
+        (let [i (model/index-of-id (get order k))]
+          (do
+            (if (< i 0)
+                0
+                (let [w (model/win i)]
+                  (if (and (= (.project w) (model/active))
+                           (= (.screen w) (.id scr))
+                           (not (.minimized w)))
+                      (make-proxy! w scr)
+                      0)))
+            (set! k (- k 1)))))
+      (free! (mut order)))))
+
+(defn listed? [(order (ArrayList u32)) (id u32)] (-> bool)
+  (let [(mut i) 0
+        (mut found) false]
+    (do
+      (while (and (< i (len order)) (not found))
+        (do
+          (if (= (get order i) id) (set! found true) 0)
+          (set! i (+ i 1))))
+      found)))
+
+;;; Cover `screen` with pictures for a pan. Returns false (and shows nothing)
+;;; when the pictures are not cached yet or the user is dragging a window;
+;;; that gesture then moves the real windows directly.
+(defn begin! [(screen u32) (live bool)] (-> bool)
+  (let [si (model/screen-index screen)]
+    (if (or (< si 0) (not (ready? screen)) (model/mouse-down?))
+        false
+        (let [scr (model/screen-at si)
+              f (.frame scr)
+              primary-h (.h (msg CGRect (main-screen) c"frame" []))
+              window (.window (state))]
+          (do
+            (set! (.generation (state)) (+ (.generation (state)) 1))
+            (set! (.screen (state)) screen)
+            (set! (.live (state)) live)
+            ;; start from where the windows really are, not where we last put them
+            (let [(mut frames)
+                    (ArrayList::new [winlist/Frame] (malloc-allocator))]
+              (do
+                (winlist/frames! (mut frames))
+                (let [fixed (model/resync-screen! screen (load frames))]
+                  (if (and (debug?) (> fixed 0))
+                      (do
+                        (println "[overlay] {d} window(s) were not where the model had them; corrected"
+                                 fixed)
+                        0)
+                      0))
+                (free! (mut frames))))
+            (no-actions)
+            (clear-proxies!)
+            (msg void
+                 window
+                 c"setFrame:display:"
+                 [CGRect u8]
+                 (rect (.x f) (- primary-h (+ (.y f) (.h f))) (.w f) (.h f))
+                 (primitive/cast u8 0))
+            (msg void
+                 (.background (state))
+                 c"setFrame:"
+                 [CGRect]
+                 (rect 0.0 0.0 (.w f) (.h f)))
+            (msg void
+                 (.background (state))
+                 c"setContents:"
+                 [(ptr i8)]
+                 (picture-of (primitive/cast u32 0) screen))
+            (msg void
+                 (.background (state))
+                 c"setContentsScale:"
+                 [f64]
+                 (scale-of screen))
+            (msg void
+                 (.container (state))
+                 c"setFrame:"
+                 [CGRect]
+                 (rect 0.0 0.0 (.w f) (.h f)))
+            (build-proxies! scr)
+            (commit)
+            (msg void window c"setAlphaValue:" [f64] 1.0)
+            (msg void window c"orderFrontRegardless" [])
+            (set! (.showing (state)) true)
+            (if live (start-streams!) 0)
+            true)))))
+
+;;; Move every picture by `dx` points.
+(defn shift! [(dx f64)] (-> i64)
+  (if (not (.showing (state)))
+      0
+      (let [c (.container (state))
+            p (msg CGPoint c c"position" [])]
+        (do
+          (no-actions)
+          (msg void
+               c
+               c"setPosition:"
+               [CGPoint]
+               (CGPoint :x (+ (.x p) dx) :y (.y p)))
+          (commit)))))
+
+(defn hide-now [(ctx (ptr i8))] (-> void)
+  (let [generation (primitive/cast i64 ctx)]
+    ;; a pan that started during the fade owns the overlay now
+    (if (or (!= generation (.generation (state))) (.showing (state)))
+        0
+        (do
+          (msg void (.window (state)) c"orderOut:" [(ptr i8)] (nil))
+          (no-actions)
+          (clear-proxies!)
+          (commit)
+          0))))
+
+;;; Slide each picture onto the real window it stands for, wherever that
+;;; window actually ended up. Returns how many pictures had to move.
+(defn settle-onto-windows! [] (-> i64)
+  (let [(mut frames) (ArrayList::new [winlist/Frame] (malloc-allocator))
+        si (model/screen-index (.screen (state)))
+        (mut i) 0
+        (mut moved) 0
+        (mut worst) 0.0]
+    (do
+      (winlist/frames! (mut frames))
+      (if (< si 0)
+          0
+          (let [scr (model/screen-at si)
+                shift (.x (msg CGRect (.container (state)) c"frame" []))]
+            (do
+              (msg void (cls c"CATransaction") c"begin" [])
+              (msg void
+                   (cls c"CATransaction")
+                   c"setAnimationDuration:"
+                   [f64]
+                   FADE-SECONDS)
+              (while (< i (len (.proxies (state))))
+                (let [p (get (.proxies (state)) i)
+                      wi (model/index-of-id (.id p))]
+                  (do
+                    (if (< wi 0)
+                        0
+                        (let [w (model/win wi)]
+                          ;; a window waiting off screen just fades with its picture
+                          (if (not (.shown w))
+                              0
+                              (match (winlist/frame-of (load frames) (.id p))
+                                (None [] 0)
+                                (Some [f]
+                                      (let [want
+                                              (rect (- (- (.x f)
+                                                          (.x (.frame scr)))
+                                                       shift)
+                                                    (layer-y scr (.y f) (.h f))
+                                                    (.w f)
+                                                    (.h f))
+                                            have
+                                              (msg CGRect
+                                                   (.layer p)
+                                                   c"frame"
+                                                   [])
+                                            off
+                                              (+ (abs-f (- (.x want) (.x have)))
+                                                 (abs-f (- (.y want) (.y have))))]
+                                        (if (<= off 1.0)
+                                            0
+                                            (do
+                                              (msg void
+                                                   (.layer p)
+                                                   c"setFrame:"
+                                                   [CGRect]
+                                                   want)
+                                              (if (> off worst)
+                                                  (set! worst off)
+                                                  0)
+                                              (set! moved (+ moved 1))
+                                              0))))))))
+                    (set! i (+ i 1)))))
+              (msg void (cls c"CATransaction") c"commit" [])
+              0)))
+      (free! (mut frames))
+      (if (and (debug?) (> moved 0))
+          (do
+            (println "[overlay] {d} picture(s) slid onto their windows (worst {f}pt off)"
+                     (load moved)
+                     (load worst))
+            0)
+          0)
+      (load moved))))
+
+(defn abs-f [(x f64)] (-> f64)
+  (if (< x 0.0) (- 0.0 x) x))
+
+(defn debug? [] (-> bool)
+  (not (nil? (getenv c"WM_DEBUG_PAN"))))
+
+(extern getenv :cc c [(ptr i8)] (-> (ptr i8)))
+
+;; Fade the overlay out, unless a new pan took it over meanwhile.
+(defn fade-out [(ctx (ptr i8))] (-> void)
+  (let [generation (primitive/cast i64 ctx)]
+    (if (or (!= generation (.generation (state))) (.showing (state)))
+        0
+        (do
+          (msg void (cls c"NSAnimationContext") c"beginGrouping" [])
+          (msg void
+               (send (cls c"NSAnimationContext") c"currentContext")
+               c"setDuration:"
+               [f64]
+               FADE-SECONDS)
+          (msg void
+               (send (.window (state)) c"animator")
+               c"setAlphaValue:"
+               [f64]
+               0.0)
+          (msg void (cls c"NSAnimationContext") c"endGrouping" [])
+          (dispatch_after_f (dispatch_time (primitive/cast u64 0) FADE-NS)
+                            (primitive/linker-address _dispatch_main_q)
+                            ctx
+                            (fnptr-of hide-now))
+          0))))
+
+;;; The real windows are in place: line the pictures up with them exactly,
+;;; then fade the pictures away.
+(defn finish! [] (-> i64)
+  (if (not (.showing (state)))
+      0
+      (do
+        (set! (.showing (state)) false)
+        (stop-streams!)
+        (if (> (settle-onto-windows!) 0)
+            (dispatch_after_f (dispatch_time (primitive/cast u64 0) FADE-NS)
+                              (primitive/linker-address _dispatch_main_q)
+                              (primitive/cast (ptr i8) (.generation (state)))
+                              (fnptr-of fade-out))
+            (fade-out (primitive/cast (ptr i8) (.generation (state)))))
+        0)))
+
+;; ---- live streams (Live Glide) ----
+
+(defn proxy-index-of-stream [(stream (ptr i8))] (-> i64)
+  (let [(mut i) 0
+        (mut found) -1]
+    (do
+      (while (and (< i (len (.proxies (state)))) (< found 0))
+        (do
+          (if (= (.stream (get (.proxies (state)) i)) stream) (set! found i) 0)
+          (set! i (+ i 1))))
+      found)))
+
+;;; A frame from a stream, handed from the stream queue to the main thread.
+(defstruct Frame [(stream (ptr i8)) (pixels (ptr i8))])
+
+;; main thread: show a streamed frame on its window's picture
+(defn frame-ready [(ctx (ptr i8))] (-> void)
+  (let [f (primitive/cast (ptr Frame) ctx)
+        i (proxy-index-of-stream (.stream f))]
+    (do
+      (if (< i 0)
+          (ax/release (.pixels f))
+          (let [p (get (.proxies (state)) i)]
+            (do
+              (no-actions)
+              (msg void
+                   (.layer p)
+                   c"setContents:"
+                   [(ptr i8)]
+                   (CVPixelBufferGetIOSurface (.pixels f)))
+              (commit)
+              (if (nil? (.frame p)) 0 (do (ax/release (.frame p)) 0))
+              (set! (mut (.proxies (state)))
+                    i
+                    (Proxy
+                      :id (.id p)
+                      :layer (.layer p)
+                      :stream (.stream p)
+                      :frame (.pixels f)))
+              0)))
+      (free (primitive/cast (ptr i8) f)))))
+
+;; stream queue: SCStreamOutput
+(defn stream-output [(self (ptr i8))
+                     (cmd (ptr i8))
+                     (stream (ptr i8))
+                     (sample (ptr i8))
+                     (kind i64)] (-> void)
+  (if (!= kind OUTPUT-SCREEN)
+      0
+      (let [pixels (CMSampleBufferGetImageBuffer sample)]
+        (if (nil? pixels)
+            0
+            (let [f
+                    (primitive/cast (ptr Frame)
+                                    (malloc (primitive/cast u64 (sizeof Frame))))]
+              (do
+                (set! (.stream f) stream)
+                (set! (.pixels f) (ax/retain pixels))
+                (dispatch_async_f (primitive/linker-address _dispatch_main_q)
+                                  (primitive/cast (ptr i8) f)
+                                  (fnptr-of frame-ready))
+                0))))))
+
+(defn stream-started [(block (ptr i8)) (error (ptr i8))] (-> void)
+  (forget 0))
+
+(defn stream-stopped [(block (ptr i8)) (error (ptr i8))] (-> void)
+  (forget 0))
+
+(defn start-streams! [] (-> i64)
+  (let [(mut i) 0]
+    (do
+      (while (< i (len (.proxies (state))))
+        (let [p (get (.proxies (state)) i)
+              wi (model/index-of-id (.id p))]
+          (do
+            (if (< wi 0)
+                0
+                (let [w (model/win wi)
+                      sc (sc-window-now (.id p))]
+                  (if (nil? sc)
+                      0
+                      (let [filter
+                              (msg (ptr i8)
+                                   (send (cls c"SCContentFilter") c"alloc")
+                                   c"initWithDesktopIndependentWindow:"
+                                   [(ptr i8)]
+                                   sc)
+                            config
+                              (capture-config (.w (.size w))
+                                              (.h (.size w))
+                                              (scale-of (.screen w)))
+                            stream
+                              (msg (ptr i8)
+                                   (send (cls c"SCStream") c"alloc")
+                                   c"initWithFilter:configuration:delegate:"
+                                   [(ptr i8) (ptr i8) (ptr i8)]
+                                   filter
+                                   config
+                                   (nil))]
+                        (do
+                          (msg void config c"setQueueDepth:" [i64] 4)
+                          (msg u8
+                               stream
+                               c"addStreamOutput:type:sampleHandlerQueue:error:"
+                               [(ptr i8) i64 (ptr i8) (ptr i8)]
+                               (.output (state))
+                               OUTPUT-SCREEN
+                               (.queue (state))
+                               (nil))
+                          (msg void
+                               stream
+                               c"startCaptureWithCompletionHandler:"
+                               [(ptr i8)]
+                               (global-block (primitive/alloc-static Block)
+                                             (primitive/cast (ptr i8)
+                                                             (fnptr-of stream-started))))
+                          (send filter c"release")
+                          (send config c"release")
+                          (set! (mut (.proxies (state)))
+                                i
+                                (Proxy
+                                  :id (.id p)
+                                  :layer (.layer p)
+                                  :stream stream
+                                  :frame (.frame p)))
+                          0)))))
+            (set! i (+ i 1)))))
+      0)))
+
+(defn stop-streams! [] (-> i64)
+  (let [(mut i) 0]
+    (do
+      (while (< i (len (.proxies (state))))
+        (let [p (get (.proxies (state)) i)]
+          (do
+            (if (nil? (.stream p))
+                0
+                (do
+                  (msg void
+                       (.stream p)
+                       c"stopCaptureWithCompletionHandler:"
+                       [(ptr i8)]
+                       (global-block (primitive/alloc-static Block)
+                                     (primitive/cast (ptr i8)
+                                                     (fnptr-of stream-stopped))))
+                  (push! (mut (.retired (state))) (.stream p))
+                  (set! (mut (.proxies (state)))
+                        i
+                        (Proxy
+                          :id (.id p)
+                          :layer (.layer p)
+                          :stream (nil)
+                          :frame (.frame p)))
+                  0))
+            (set! i (+ i 1)))))
+      0)))
+
+;;; The SCWindow for `id` from the most recent finished listing, or null.
+(defn sc-window-now [(id u32)] (-> (ptr i8))
+  (let [content (.listing (state))]
+    (if (nil? content) (nil) (sc-window content id))))
+
+;; ---- setup ----
+
+(defn make-window [] (-> (ptr i8))
+  (let [window
+          (msg (ptr i8)
+               (send (cls c"NSPanel") c"alloc")
+               c"initWithContentRect:styleMask:backing:defer:"
+               [CGRect u64 u64 u8]
+               (rect 0.0 0.0 100.0 100.0)
+               (primitive/cast u64 STYLE-NONACTIVATING-PANEL)
+               (primitive/cast u64 BACKING-BUFFERED)
+               (primitive/cast u8 0))]
+    (do
+      (msg void
+           window
+           c"setLevel:"
+           [i64]
+           (- (primitive/cast i64
+                              (CGWindowLevelForKey (primitive/cast i32
+                                                                   WINDOW-LEVEL-KEY-DOCK)))
+              1))
+      (msg void window c"setOpaque:" [u8] (primitive/cast u8 0))
+      (msg void window c"setBackgroundColor:" [(ptr i8)] (color c"clearColor"))
+      (msg void window c"setHasShadow:" [u8] (primitive/cast u8 0))
+      (msg void window c"setIgnoresMouseEvents:" [u8] (primitive/cast u8 1))
+      (msg void window c"setHidesOnDeactivate:" [u8] (primitive/cast u8 0))
+      (msg void
+           window
+           c"setCollectionBehavior:"
+           [u64]
+           (primitive/cast u64 COLLECTION-BEHAVIOR))
+      window)))
+
+(defn init! [] (-> i64)
+  (let [window (make-window)
+        host (make-view c"NSView" (rect 0.0 0.0 100.0 100.0))
+        root (new-layer)
+        background (new-layer)
+        container (new-layer)
+        out-class (begin-class c"WMStreamOutput" c"NSObject")
+        timer-class (begin-class c"WMPictureRefresher" c"NSObject")]
+    (do
+      (add-method out-class
+                  c"stream:didOutputSampleBuffer:ofType:"
+                  (primitive/cast (ptr i8) (fnptr-of stream-output))
+                  c"v@:@^{opaqueCMSampleBuffer=}q")
+      (finish-class out-class)
+      (add-method timer-class
+                  c"tick:"
+                  (primitive/cast (ptr i8) (fnptr-of on-refresh-tick))
+                  c"v@:@")
+      (finish-class timer-class)
+      (msg void host c"setLayer:" [(ptr i8)] root)
+      (msg void host c"setWantsLayer:" [u8] (primitive/cast u8 1))
+      (layer-add! root background)
+      (layer-add! root container)
+      (msg void window c"setContentView:" [(ptr i8)] host)
+      (set! (.window (state)) window)
+      (set! (.host (state)) host)
+      (set! (.background (state)) background)
+      (set! (.container (state)) container)
+      (set! (.proxies (state)) (ArrayList::new [Proxy] (malloc-allocator)))
+      (set! (.pictures (state)) (ArrayList::new [Picture] (malloc-allocator)))
+      (set! (.retired (state)) (ArrayList::new [(ptr i8)] (malloc-allocator)))
+      (set! (.output (state)) (send (send out-class c"alloc") c"init"))
+      (set! (.queue (state))
+            (dispatch_queue_create c"wm.overlay.streams" (nil)))
+      (set! (.showing (state)) false)
+      (set! (.listing (state)) (nil))
+      (set! (.listing-pending (state)) false)
+      (set! (.in-flight (state)) false)
+      (set! (.backgrounds-changed-ms (state)) (now-ms))
+      (msg (ptr i8)
+           (cls c"NSTimer")
+           c"scheduledTimerWithTimeInterval:target:selector:userInfo:repeats:"
+           [f64 (ptr i8) (ptr i8) (ptr i8) u8]
+           TICK-SECONDS
+           (send (send timer-class c"alloc") c"init")
+           (sel c"tick:")
+           (nil)
+           (primitive/cast u8 1))
+      0)))

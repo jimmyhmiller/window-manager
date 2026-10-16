@@ -1,0 +1,654 @@
+(module wm.strip)
+
+;;; The project strip: Stage Manager-style stacks of each project's windows,
+;;; drawn straight onto the desktop at the level of Finder's desktop icons, so
+;;; every ordinary window covers it. No panel, no background — just tilted
+;;; window thumbnails and desktop-icon labels on the wallpaper.
+
+(import "coil.primitive" :as primitive)
+(import "coil.alloc" :use [malloc-allocator])
+(import "coil.arraylist" :use [ArrayList])
+(import "coil.str" :use [from-cstr])
+(import "wm.objc" :use *)
+(import "wm.cocoa" :use *)
+(import "wm.capture" :as capture)
+(import "wm.model" :as model)
+
+(const STRIP-WIDTH 210.0)
+
+;; distance from the screen edge to the stacks' center line
+(const STACK-INSET 104.0)
+
+(const CARD-MAX-W 150.0)
+
+(const CARD-MAX-H 96.0)
+
+(const SLOT-MAX-H 190.0)
+
+(const MAX-CARDS 3)
+
+;; back cards step up and away from the stage and shrink, like a Stage
+;; Manager group
+(const CARD-STEP-X -9.0)
+
+(const CARD-STEP-Y 8.0)
+
+(const CARD-STEP-SCALE 0.93)
+
+;; rotation about the vertical axis: the edge nearer the stage recedes
+(const TILT 0.5)
+
+(const HOVER-TILT 0.2)
+
+(const HOVER-SCALE 1.07)
+
+(const EYE-DISTANCE 340.0)
+
+(const LABEL-GAP 16.0)
+
+(const REFRESH-SECONDS 3.0)
+
+(const STYLE-NONACTIVATING-PANEL 128)
+
+(const BACKING-BUFFERED 2)
+
+;; canJoinAllSpaces | stationary | ignoresCycle
+(const COLLECTION-BEHAVIOR 81)
+
+;; NSTrackingMouseEnteredAndExited | MouseMoved | ActiveAlways | InVisibleRect
+(const TRACKING-OPTIONS 643)
+
+;;; The screen edge the strip sits on; stacks tilt toward the screen's middle.
+(defsum Edge (Left) (Right))
+
+(defstruct Strip
+  [(stacks (ArrayList (ptr i8)))
+   (window (ptr i8))
+   (view (ptr i8))
+   (host (ptr i8))
+   (edge Edge)
+   (hover i64)
+   (renaming i64)])
+
+(defn strip [] (-> (ptr Strip))
+  (primitive/alloc-static Strip))
+
+(defn project-count [] (-> i64)
+  (model/project-count))
+
+;; NSTextAlignmentCenter on Apple silicon
+(const TEXT-ALIGN-CENTER 1)
+
+(const RENAME-WIDTH 170.0)
+
+;; ---- layout ----
+
+;;; +1 on the left edge, -1 on the right: mirrors every horizontal offset and tilt.
+(defn facing [] (-> f64)
+  (match (.edge (strip))
+    (Left [] 1.0)
+    (Right [] -1.0)))
+
+(defn stack-center-x [] (-> f64)
+  (match (.edge (strip))
+    (Left [] STACK-INSET)
+    (Right [] (- STRIP-WIDTH STACK-INSET))))
+
+(defn min-f [(a f64) (b f64)] (-> f64)
+  (if (< a b) a b))
+
+(defn slot-height [] (-> f64)
+  (let [h (.h (msg CGRect (.view (strip)) c"bounds" []))]
+    (min-f SLOT-MAX-H (/ (- h 80.0) (primitive/cast f64 (project-count))))))
+
+;;; Vertical center of project `i`'s stack; the stacks are centered as a group.
+(defn stack-center-y [(i i64)] (-> f64)
+  (let [h (.h (msg CGRect (.view (strip)) c"bounds" []))
+        slot (slot-height)
+        top (+ (/ h 2.0) (/ (* slot (primitive/cast f64 (project-count))) 2.0))]
+    (+ (- top (* slot (+ (primitive/cast f64 i) 0.5))) 10.0)))
+
+(defn stack-transform [(hovered bool)] (-> CATransform3D)
+  (if hovered
+      (CATransform3DScale (CATransform3DRotate (perspective EYE-DISTANCE)
+                                               (* (facing) HOVER-TILT)
+                                               0.0
+                                               1.0
+                                               0.0)
+                          HOVER-SCALE
+                          HOVER-SCALE
+                          1.0)
+      (CATransform3DRotate (perspective EYE-DISTANCE)
+                           (* (facing) TILT)
+                           0.0
+                           1.0
+                           0.0)))
+
+;;; Card size for a window: as large as fits the card box, keeping its aspect.
+(defn card-size [(frame CGRect)] (-> CGSize)
+  (let [aspect (/ (.h frame) (.w frame))]
+    (if (> (* CARD-MAX-W aspect) CARD-MAX-H)
+        (CGSize :w (/ CARD-MAX-H aspect) :h CARD-MAX-H)
+        (CGSize :w CARD-MAX-W :h (* CARD-MAX-W aspect)))))
+
+(defn add-card! [(stack (ptr i8)) (shot capture/Shot) (depth i64)] (-> i64)
+  (let [size (card-size (.frame shot))
+        card (new-layer)
+        d (primitive/cast f64 depth)
+        scale
+          (if (= depth 0)
+              1.0
+              (if (= depth 1)
+                  CARD-STEP-SCALE
+                  (* CARD-STEP-SCALE CARD-STEP-SCALE)))
+        bounds (layer-bounds stack)]
+    (do
+      (msg void card c"setBounds:" [CGRect] (rect 0.0 0.0 (.w size) (.h size)))
+      (msg void
+           card
+           c"setPosition:"
+           [CGPoint]
+           (CGPoint
+             :x (+ (/ (.w bounds) 2.0) (* d (* (facing) CARD-STEP-X)))
+             :y (+ (/ (.h bounds) 2.0) (* d CARD-STEP-Y))))
+      (msg void
+           card
+           c"setTransform:"
+           [CATransform3D]
+           (CATransform3DMakeScale scale scale 1.0))
+      (msg void card c"setZPosition:" [f64] (* d -1.0))
+      (msg void card c"setContentsScale:" [f64] (backing-scale (main-screen)))
+      (if (nil? (.image shot))
+          (do
+            (msg void
+                 card
+                 c"setBackgroundColor:"
+                 [(ptr i8)]
+                 (cg-color 1.0 0.12))
+            (msg void card c"setCornerRadius:" [f64] 8.0)
+            0)
+          (do (msg void card c"setContents:" [(ptr i8)] (.image shot)) 0))
+      (layer-shadow! card (primitive/cast f32 0.35) 7.0 -4.0)
+      (layer-add! stack card))))
+
+;;; An empty project: a faint frosted outline where its windows would be.
+(defn add-placeholder! [(stack (ptr i8))] (-> i64)
+  (let [card (new-layer)
+        bounds (layer-bounds stack)]
+    (do
+      (msg void
+           card
+           c"setBounds:"
+           [CGRect]
+           (rect 0.0 0.0 (- CARD-MAX-W 12.0) (- CARD-MAX-H 8.0)))
+      (msg void
+           card
+           c"setPosition:"
+           [CGPoint]
+           (CGPoint :x (/ (.w bounds) 2.0) :y (/ (.h bounds) 2.0)))
+      (msg void card c"setBackgroundColor:" [(ptr i8)] (cg-color 1.0 0.10))
+      (msg void card c"setBorderColor:" [(ptr i8)] (cg-color 1.0 0.30))
+      (msg void card c"setBorderWidth:" [f64] 1.0)
+      (msg void card c"setCornerRadius:" [f64] 10.0)
+      (layer-add! stack card))))
+
+(defn layer-bounds [(layer (ptr i8))] (-> CGRect)
+  (msg CGRect layer c"bounds" []))
+
+;;; The shots belonging to project `p`, front-most first, at most MAX-CARDS.
+(defn project-shots [(p i64) (out (mut (ArrayList capture/Shot)))] (-> i64)
+  (let [(mut i) 0]
+    (do
+      (while (and (< i (capture/shot-count)) (< (len out) MAX-CARDS))
+        (let [s (capture/shot i)]
+          (do
+            (if (= (model/project-of-window-id (capture/shot-window-id s)) p)
+                (do (push! (mut out) s) 0)
+                0)
+            (set! i (+ i 1)))))
+      (len out))))
+
+(defn build-stack! [(p i64)] (-> (ptr i8))
+  (let [stack (new-layer)
+        cy (stack-center-y p)
+        (mut shots) (ArrayList::new [capture/Shot] (malloc-allocator))
+        n (project-shots p (mut shots))]
+    (do
+      (layer-frame! stack
+                    (rect (- (stack-center-x) 90.0) (- cy 60.0) 180.0 120.0))
+      (msg void
+           stack
+           c"setSublayerTransform:"
+           [CATransform3D]
+           (stack-transform (= p (.hover (strip)))))
+      (if (= n 0)
+          (add-placeholder! stack)
+          (let [(mut k) (- n 1)]
+            (while (>= k 0)
+              (do
+                (add-card! stack (get shots k) k)
+                (set! k (- k 1))))))
+      (free! (mut shots))
+      (layer-add! (layer-of (.host (strip))) stack)
+      stack)))
+
+(defn layer-of [(view (ptr i8))] (-> (ptr i8))
+  (send view c"layer"))
+
+(defn text-shadow [] (-> (ptr i8))
+  (let [shadow (send (send (cls c"NSShadow") c"alloc") c"init")]
+    (do
+      (msg void shadow c"setShadowColor:" [(ptr i8)] (gray 0.0 0.6))
+      (msg void shadow c"setShadowBlurRadius:" [f64] 3.0)
+      (msg void shadow c"setShadowOffset:" [CGSize] (CGSize :w 0.0 :h -1.0))
+      (send shadow c"autorelease"))))
+
+;;; A desktop-icon label under the stack; the active project gets Finder's
+;;; selected-label highlight behind its name.
+(defn label-center-y [(p i64)] (-> f64)
+  (- (- (stack-center-y p) (/ CARD-MAX-H 2.0)) LABEL-GAP))
+
+(defn build-label! [(p i64)] (-> i64)
+  (let [active (= p (model/active))
+        field
+          (label (model/project-name p)
+                 (system-font 12.0
+                              (if active (weight-semibold) (weight-medium)))
+                 (color c"whiteColor"))
+        size (msg CGSize field c"fittingSize" [])
+        y (label-center-y p)
+        frame
+          (rect (- (stack-center-x) (/ (.w size) 2.0))
+                (- y (/ (.h size) 2.0))
+                (.w size)
+                (.h size))]
+    (do
+      (if active
+          (let [pill
+                  (make-view c"NSView"
+                             (rect (- (.x frame) 7.0)
+                                   (- (.y frame) 2.0)
+                                   (+ (.w frame) 14.0)
+                                   (+ (.h frame) 4.0)))]
+            (do
+              (msg void pill c"setWantsLayer:" [u8] (primitive/cast u8 1))
+              (msg void
+                   (send pill c"layer")
+                   c"setBackgroundColor:"
+                   [(ptr i8)]
+                   (cg-color 1.0 0.24))
+              (msg void (send pill c"layer") c"setCornerRadius:" [f64] 5.0)
+              (add-subview (.view (strip)) pill)
+              (send pill c"release")
+              0))
+          (do (msg void field c"setShadow:" [(ptr i8)] (text-shadow)) 0))
+      (set-frame field frame)
+      (add-subview (.view (strip)) field))))
+
+;;; Throw away and rebuild every stack and label from the latest thumbnails.
+(defn rebuild! [] (-> i64)
+  (let [view (.view (strip))
+        host (.host (strip))
+        (mut p) 0]
+    ;; a rebuild would remove the rename field mid-edit; it reruns afterwards
+    (if (>= (.renaming (strip)) 0)
+        0
+        (do
+          (msg void (layer-of host) c"setSublayers:" [(ptr i8)] (nil))
+          (msg void
+               view
+               c"setSubviews:"
+               [(ptr i8)]
+               (msg (ptr i8)
+                    (cls c"NSArray")
+                    c"arrayWithObject:"
+                    [(ptr i8)]
+                    host))
+          (clear! (mut (.stacks (strip))))
+          (while (< p (project-count))
+            (do
+              (push! (mut (.stacks (strip))) (build-stack! p))
+              (build-label! p)
+              (set! p (+ p 1))))
+          0))))
+
+(defn model-changed [] (-> void)
+  (rebuild!))
+
+;; ---- input ----
+
+;;; The project whose stack or label is under `pt`, or -1.
+(defn project-at [(pt CGPoint)] (-> i64)
+  (let [(mut p) 0
+        (mut found) -1
+        half (/ (slot-height) 2.0)]
+    (do
+      (while (and (< p (project-count)) (< found 0))
+        (let [cy (stack-center-y p)]
+          (do
+            (if (and (>= (.x pt) (- (stack-center-x) 95.0))
+                     (<= (.x pt) (+ (stack-center-x) 95.0))
+                     (>= (.y pt) (- cy (+ half 8.0)))
+                     (<= (.y pt) (+ cy (- half 8.0))))
+                (set! found p)
+                0)
+            (set! p (+ p 1)))))
+      found)))
+
+(defn event-point [(event (ptr i8))] (-> CGPoint)
+  (msg CGPoint event c"locationInWindow" []))
+
+(defn set-hover! [(p i64)] (-> i64)
+  (let [old (.hover (strip))]
+    (if (= old p)
+        0
+        (do
+          (if (>= old 0)
+              (do
+                (msg void
+                     (get (.stacks (strip)) old)
+                     c"setSublayerTransform:"
+                     [CATransform3D]
+                     (stack-transform false))
+                0)
+              0)
+          (if (>= p 0)
+              (do
+                (msg void
+                     (get (.stacks (strip)) p)
+                     c"setSublayerTransform:"
+                     [CATransform3D]
+                     (stack-transform true))
+                0)
+              0)
+          (set! (.hover (strip)) p)
+          0))))
+
+(defn view-mouse-moved [(self (ptr i8)) (cmd (ptr i8)) (event (ptr i8))]
+  (-> void)
+  (set-hover! (project-at (event-point event))))
+
+(defn view-mouse-exited [(self (ptr i8)) (cmd (ptr i8)) (event (ptr i8))]
+  (-> void)
+  (set-hover! -1))
+
+(defn view-mouse-down [(self (ptr i8)) (cmd (ptr i8)) (event (ptr i8))]
+  (-> void)
+  (let [p (project-at (event-point event))]
+    (cond (< p 0) 0
+          ;; double-clicking a name renames it, like a desktop icon
+          (and (>= (msg i64 event c"clickCount" []) 2) (= p (model/active)))
+            (begin-rename! p)
+          :else (model/switch! p))))
+
+;; ---- context menu and renaming ----
+
+(defn menu-item [(menu (ptr i8))
+                 (title (ptr i8))
+                 (action (ptr i8))
+                 (tag i64)
+                 (enabled bool)] (-> i64)
+  (let [item
+          (msg (ptr i8)
+               (send (cls c"NSMenuItem") c"alloc")
+               c"initWithTitle:action:keyEquivalent:"
+               [(ptr i8) (ptr i8) (ptr i8)]
+               (nsstr title)
+               (sel action)
+               (nsstr c""))]
+    (do
+      (msg void item c"setTarget:" [(ptr i8)] (.view (strip)))
+      (msg void item c"setTag:" [i64] tag)
+      (msg void item c"setEnabled:" [u8] (primitive/cast u8 (if enabled 1 0)))
+      (msg void menu c"addItem:" [(ptr i8)] item)
+      (send item c"release")
+      0)))
+
+(defn view-right-mouse-down [(self (ptr i8)) (cmd (ptr i8)) (event (ptr i8))]
+  (-> void)
+  (let [p (project-at (event-point event))
+        menu (send (send (cls c"NSMenu") c"alloc") c"init")]
+    (do
+      (msg void menu c"setAutoenablesItems:" [u8] (primitive/cast u8 0))
+      (if (< p 0)
+          0
+          (do
+            (menu-item menu c"Rename…" c"renameProject:" p true)
+            (menu-item menu
+                       c"Delete Project"
+                       c"deleteProject:"
+                       p
+                       (> (project-count) 1))
+            (msg void
+                 menu
+                 c"addItem:"
+                 [(ptr i8)]
+                 (send (cls c"NSMenuItem") c"separatorItem"))
+            0))
+      (menu-item menu c"New Project" c"newProject:" -1 true)
+      (msg void
+           (cls c"NSMenu")
+           c"popUpContextMenu:withEvent:forView:"
+           [(ptr i8) (ptr i8) (ptr i8)]
+           menu
+           event
+           self)
+      (send menu c"release")
+      0)))
+
+(defn sender-tag [(sender (ptr i8))] (-> i64)
+  (msg i64 sender c"tag" []))
+
+(defn view-rename-project [(self (ptr i8)) (cmd (ptr i8)) (sender (ptr i8))]
+  (-> void)
+  (begin-rename! (sender-tag sender)))
+
+(defn view-delete-project [(self (ptr i8)) (cmd (ptr i8)) (sender (ptr i8))]
+  (-> void)
+  (model/delete-project! (sender-tag sender)))
+
+(defn view-new-project [(self (ptr i8)) (cmd (ptr i8)) (sender (ptr i8))]
+  (-> void)
+  (let [(mut buf) (zeroed (array i8 64))
+        p
+          (model/add-project! (model/untitled-name (primitive/cast (ptr i8)
+                                                                   (mut buf))
+                                                   64))]
+    (do
+      (model/switch! p)
+      (begin-rename! p))))
+
+;;; Edit project `p`'s name in place. Typing needs keyboard focus, so the app
+;;; activates for the edit and hands focus back afterwards.
+(defn begin-rename! [(p i64)] (-> i64)
+  (let [y (label-center-y p)
+        field
+          (make-view c"NSTextField"
+                     (rect (- (stack-center-x) (/ RENAME-WIDTH 2.0))
+                           (- y 11.0)
+                           RENAME-WIDTH
+                           22.0))]
+    (do
+      (rebuild!)
+      (set! (.renaming (strip)) p)
+      (msg void
+           field
+           c"setStringValue:"
+           [(ptr i8)]
+           (nsstr (model/project-name p)))
+      (msg void field c"setFont:" [(ptr i8)] (system-font 12.0 (weight-medium)))
+      (msg void field c"setAlignment:" [i64] TEXT-ALIGN-CENTER)
+      (msg void field c"setDelegate:" [(ptr i8)] (.view (strip)))
+      (add-subview (.view (strip)) field)
+      (send field c"release")
+      (msg void (.window (strip)) c"makeKeyWindow" [])
+      (msg u8 (.window (strip)) c"makeFirstResponder:" [(ptr i8)] field)
+      0)))
+
+;; NSControlTextEditingDelegate: commit the new name when editing ends.
+(defn view-text-did-end-editing [(self (ptr i8)) (cmd (ptr i8)) (note (ptr i8))]
+  (-> void)
+  (let [field (send note c"object")
+        p (.renaming (strip))
+        name (nsstr-cstr (send field c"stringValue"))]
+    (if (< p 0)
+        0
+        (do
+          (set! (.renaming (strip)) -1)
+          (msg void field c"removeFromSuperview" [])
+          (if (= (load name) (primitive/cast i8 0))
+              (rebuild!)
+              (model/rename-project! p name))
+          (msg void (.window (strip)) c"resignKeyWindow" [])
+          (model/refocus!)))))
+
+(defn panel-can-become-key [(self (ptr i8)) (cmd (ptr i8))] (-> u8)
+  (primitive/cast u8 1))
+
+(defn view-accepts-first-mouse [(self (ptr i8)) (cmd (ptr i8)) (event (ptr i8))]
+  (-> u8)
+  (primitive/cast u8 1))
+
+(defn view-tick [(self (ptr i8)) (cmd (ptr i8)) (timer (ptr i8))] (-> void)
+  (if (.busy (capture/state))
+      0
+      (capture/refresh! (thumb-pixels) (fnptr-of thumbnails-ready))))
+
+(defn thumbnails-ready [] (-> void)
+  (rebuild!))
+
+(defn thumb-pixels [] (-> f64)
+  (* CARD-MAX-W (backing-scale (main-screen))))
+
+;; ---- construction ----
+
+(defn register-classes! [] (-> i64)
+  (let [view (begin-class c"WMStripView" c"NSView")]
+    (do
+      (add-method view
+                  c"mouseMoved:"
+                  (primitive/cast (ptr i8) (fnptr-of view-mouse-moved))
+                  c"v@:@")
+      (add-method view
+                  c"mouseExited:"
+                  (primitive/cast (ptr i8) (fnptr-of view-mouse-exited))
+                  c"v@:@")
+      (add-method view
+                  c"mouseDown:"
+                  (primitive/cast (ptr i8) (fnptr-of view-mouse-down))
+                  c"v@:@")
+      (add-method view
+                  c"acceptsFirstMouse:"
+                  (primitive/cast (ptr i8) (fnptr-of view-accepts-first-mouse))
+                  c"B@:@")
+      (add-method view
+                  c"tick:"
+                  (primitive/cast (ptr i8) (fnptr-of view-tick))
+                  c"v@:@")
+      (add-method view
+                  c"rightMouseDown:"
+                  (primitive/cast (ptr i8) (fnptr-of view-right-mouse-down))
+                  c"v@:@")
+      (add-method view
+                  c"renameProject:"
+                  (primitive/cast (ptr i8) (fnptr-of view-rename-project))
+                  c"v@:@")
+      (add-method view
+                  c"deleteProject:"
+                  (primitive/cast (ptr i8) (fnptr-of view-delete-project))
+                  c"v@:@")
+      (add-method view
+                  c"newProject:"
+                  (primitive/cast (ptr i8) (fnptr-of view-new-project))
+                  c"v@:@")
+      (add-method view
+                  c"controlTextDidEndEditing:"
+                  (primitive/cast (ptr i8) (fnptr-of view-text-did-end-editing))
+                  c"v@:@")
+      (finish-class view)
+      (let [panel (begin-class c"WMStripPanel" c"NSPanel")]
+        (do
+          (add-method panel
+                      c"canBecomeKeyWindow"
+                      (primitive/cast (ptr i8) (fnptr-of panel-can-become-key))
+                      c"B@:")
+          (finish-class panel)))
+      0)))
+
+(defn make-window [(frame CGRect)] (-> (ptr i8))
+  (let [window
+          (msg (ptr i8)
+               (send (cls c"WMStripPanel") c"alloc")
+               c"initWithContentRect:styleMask:backing:defer:"
+               [CGRect u64 u64 u8]
+               frame
+               (primitive/cast u64 STYLE-NONACTIVATING-PANEL)
+               (primitive/cast u64 BACKING-BUFFERED)
+               (primitive/cast u8 0))]
+    (do
+      (msg void window c"setLevel:" [i64] (+ (desktop-icon-level) 1))
+      (msg void window c"setOpaque:" [u8] (primitive/cast u8 0))
+      (msg void window c"setBackgroundColor:" [(ptr i8)] (color c"clearColor"))
+      (msg void window c"setHasShadow:" [u8] (primitive/cast u8 0))
+      (msg void window c"setHidesOnDeactivate:" [u8] (primitive/cast u8 0))
+      (msg void
+           window
+           c"setCollectionBehavior:"
+           [u64]
+           (primitive/cast u64 COLLECTION-BEHAVIOR))
+      window)))
+
+;;; Put the strip on the desktop and start refreshing thumbnails. Call once,
+;;; on the main thread, after NSApplication exists.
+(defn show! [(edge Edge)] (-> i64)
+  (do
+    (set! (.stacks (strip)) (ArrayList::new (malloc-allocator)))
+    (set! (.hover (strip)) -1)
+    (set! (.renaming (strip)) -1)
+    (set! (.edge (strip)) edge)
+    (register-classes!)
+    (let [vf (visible-frame (main-screen))
+          x
+            (match edge
+              (Left [] (.x vf))
+              (Right [] (- (+ (.x vf) (.w vf)) STRIP-WIDTH)))
+          frame (rect x (.y vf) STRIP-WIDTH (.h vf))
+          bounds (rect 0.0 0.0 STRIP-WIDTH (.h vf))
+          window (make-window frame)
+          view (make-view c"WMStripView" bounds)
+          host (make-view c"NSView" bounds)
+          tracking
+            (msg (ptr i8)
+                 (send (cls c"NSTrackingArea") c"alloc")
+                 c"initWithRect:options:owner:userInfo:"
+                 [CGRect u64 (ptr i8) (ptr i8)]
+                 bounds
+                 (primitive/cast u64 TRACKING-OPTIONS)
+                 view
+                 (nil))]
+      (do
+        ;; host is layer-hosting: its sublayers are ours, outside AppKit's control
+        (msg void host c"setLayer:" [(ptr i8)] (new-layer))
+        (msg void host c"setWantsLayer:" [u8] (primitive/cast u8 1))
+        (msg void view c"setWantsLayer:" [u8] (primitive/cast u8 1))
+        (add-subview view host)
+        (msg void view c"addTrackingArea:" [(ptr i8)] tracking)
+        (send tracking c"release")
+        (msg void window c"setContentView:" [(ptr i8)] view)
+        (set! (.window (strip)) window)
+        (set! (.view (strip)) view)
+        (set! (.host (strip)) host)
+        (rebuild!)
+        (msg void window c"orderFrontRegardless" [])
+        (println "[strip] window {d}" (msg i64 window c"windowNumber" []))
+        (capture/refresh! (thumb-pixels) (fnptr-of thumbnails-ready))
+        (msg (ptr i8)
+             (cls c"NSTimer")
+             c"scheduledTimerWithTimeInterval:target:selector:userInfo:repeats:"
+             [f64 (ptr i8) (ptr i8) (ptr i8) u8]
+             REFRESH-SECONDS
+             view
+             (sel c"tick:")
+             (nil)
+             (primitive/cast u8 1))
+        0))))

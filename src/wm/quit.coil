@@ -1,0 +1,60 @@
+(module wm.quit)
+
+;;; Leaving windows parked 1px from the screen edge would strand them, so
+;;; SIGINT, SIGTERM, and SIGHUP are handled on the main queue: every window is
+;;; put back in view, the `before-exit` hook runs, and the process exits.
+
+(import "coil.primitive" :as primitive)
+(import "wm.objc" :use [nil])
+(import "wm.model" :as model)
+
+(extern signal :cc c [i32 (ptr i8)] (-> (ptr i8)))
+
+(extern dispatch_source_create :cc c [(ptr u8) u64 u64 (ptr u8)] (-> (ptr i8)))
+
+(extern dispatch_source_set_event_handler_f
+        :cc
+        c
+        [(ptr i8) (fnptr c [(ptr i8)] void)]
+        (-> void))
+
+(extern dispatch_resume :cc c [(ptr i8)] (-> void))
+
+(extern exit :cc c [i32] (-> void))
+
+(const SIGHUP 1)
+
+(const SIGINT 2)
+
+(const SIGTERM 15)
+
+(defn hook [] (-> (ptr (fnptr c [] void)))
+  (primitive/alloc-static (fnptr c [] void)))
+
+(defn quit-now [(ctx (ptr i8))] (-> void)
+  (do
+    (println "[wm] quitting: restoring windows")
+    (model/restore-all!)
+    (call-ptr (load (hook)))
+    (exit (primitive/cast i32 0))))
+
+(defn handle! [(signum i64)] (-> i64)
+  (let [source
+          (dispatch_source_create (primitive/linker-address _dispatch_source_type_signal)
+                                  (primitive/cast u64 signum)
+                                  (primitive/cast u64 0)
+                                  (primitive/linker-address _dispatch_main_q))]
+    (do
+      ;; SIG_IGN, so only the dispatch source sees the signal
+      (signal (primitive/cast i32 signum) (primitive/cast (ptr i8) 1))
+      (dispatch_source_set_event_handler_f source (fnptr-of quit-now))
+      (dispatch_resume source)
+      0)))
+
+;;; Install the handlers; `before-exit` runs after windows are restored.
+(defn install! [(before-exit (fnptr c [] void))] (-> i64)
+  (do
+    (set! (hook) before-exit)
+    (handle! SIGINT)
+    (handle! SIGTERM)
+    (handle! SIGHUP)))

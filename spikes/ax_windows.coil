@@ -1,0 +1,168 @@
+(module ax-windows)
+
+(import "coil.primitive" :as primitive)
+(import "coil.io" :use *)
+(import "coil.fmt" :use *)
+(import "coil.str" :use *)
+(import "coil.alloc" :as alloc)
+
+; ---- ObjC runtime ----
+(extern objc_getClass :cc c [(ptr i8)] (-> (ptr i8)))
+(extern sel_registerName :cc c [(ptr i8)] (-> (ptr i8)))
+(extern objc_msgSend :cc c [(ptr i8) (ptr i8)] (-> (ptr i8)))
+
+; ---- CoreFoundation ----
+(extern CFStringCreateWithCString :cc c [(ptr i8) (ptr i8) u32] (-> (ptr i8)))
+(extern CFStringGetCString :cc c [(ptr i8) (ptr i8) i64 u32] (-> u8))
+(extern CFArrayGetCount :cc c [(ptr i8)] (-> i64))
+(extern CFArrayGetValueAtIndex :cc c [(ptr i8) i64] (-> (ptr i8)))
+(extern CFRelease :cc c [(ptr i8)] (-> void))
+(extern CFRunLoopGetCurrent :cc c [] (-> (ptr i8)))
+(extern CFRunLoopAddSource :cc c [(ptr i8) (ptr i8) (ptr i8)] (-> void))
+(extern CFRunLoopRunInMode :cc c [(ptr i8) f64 u8] (-> i32))
+
+; ---- Accessibility (ApplicationServices) ----
+(extern AXIsProcessTrusted :cc c [] (-> u8))
+(extern AXUIElementCreateApplication :cc c [i32] (-> (ptr i8)))
+(extern AXUIElementCopyAttributeValue :cc c [(ptr i8) (ptr i8) (ptr (ptr i8))] (-> i32))
+(extern AXUIElementSetAttributeValue :cc c [(ptr i8) (ptr i8) (ptr i8)] (-> i32))
+(extern AXValueGetValue :cc c [(ptr i8) i32 (ptr i8)] (-> u8))
+(extern AXValueCreate :cc c [i32 (ptr i8)] (-> (ptr i8)))
+(extern AXObserverCreate :cc c [i32 (fnptr c [(ptr i8) (ptr i8) (ptr i8) (ptr i8)] void) (ptr (ptr i8))] (-> i32))
+(extern AXObserverAddNotification :cc c [(ptr i8) (ptr i8) (ptr i8) (ptr i8)] (-> i32))
+(extern AXObserverGetRunLoopSource :cc c [(ptr i8)] (-> (ptr i8)))
+
+(defstruct CGPoint [(x f64) (y f64)])
+(defstruct CGSize [(w f64) (h f64)])
+
+(const UTF8 134217984) ; kCFStringEncodingUTF8 = 0x08000100
+(const AX-POINT 1)
+(const AX-SIZE 2)
+
+(defn cfstr [(s (ptr i8))] (-> (ptr i8))
+  (CFStringCreateWithCString (primitive/cast (ptr i8) 0) s (primitive/cast u32 UTF8)))
+
+(defn sel [(s (ptr i8))] (-> (ptr i8)) (sel_registerName s))
+
+(defn send0 [(recv (ptr i8)) (s (ptr i8))] (-> (ptr i8))
+  (objc_msgSend recv (sel s)))
+
+(defn send-i64 [(recv (ptr i8)) (s (ptr i8)) (a i64)] (-> (ptr i8))
+  (primitive/call-ptr (primitive/cast (fnptr c [(ptr i8) (ptr i8) i64] (ptr i8))
+                                      (primitive/fnptr-of objc_msgSend))
+                      recv (sel s) a))
+
+(defn send-pid [(recv (ptr i8))] (-> i32)
+  (primitive/call-ptr (primitive/cast (fnptr c [(ptr i8) (ptr i8)] i32)
+                                      (primitive/fnptr-of objc_msgSend))
+                      recv (sel c"processIdentifier")))
+
+(defn send-count [(recv (ptr i8))] (-> i64)
+  (primitive/call-ptr (primitive/cast (fnptr c [(ptr i8) (ptr i8)] i64)
+                                      (primitive/fnptr-of objc_msgSend))
+                      recv (sel c"count")))
+
+; copy an AX attribute; null on error
+(defn ax-get [(el (ptr i8)) (attr (ptr i8))] (-> (ptr i8))
+  (let [out (primitive/alloc-stack (ptr i8))]
+    (do
+      (primitive/store! out (primitive/cast (ptr i8) 0))
+      (let [err (AXUIElementCopyAttributeValue el (cfstr attr) out)]
+        (if (= err (primitive/cast i32 0))
+            (primitive/load out)
+            (primitive/cast (ptr i8) 0))))))
+
+(defn print-cfstr [(s (ptr i8))] (-> i64)
+  (let [buf (primitive/alloc-stack (array u8 256))]
+    (if (= s (primitive/cast (ptr i8) 0))
+        (do (print "<none>") 0)
+        (do
+          (CFStringGetCString s (primitive/cast (ptr i8) buf) 256 (primitive/cast u32 UTF8))
+          (print "{s}" (from-cstr (primitive/cast (ptr i8) buf)))
+          0))))
+
+(defn on-ax-event [(obs (ptr i8)) (el (ptr i8)) (note (ptr i8)) (refcon (ptr i8))] (-> void)
+  (do
+    (print "  [observer] ")
+    (print-cfstr note)
+    (forget (println ""))))
+
+(defn dump-windows [(pid i32)] (-> i64)
+  (let [app (AXUIElementCreateApplication pid)
+        wins (ax-get app c"AXWindows")]
+    (if (= wins (primitive/cast (ptr i8) 0))
+        0
+        (let [n (CFArrayGetCount wins)
+              (mut i) 0]
+          (do
+            (while (< (load i) n)
+              (let [w (CFArrayGetValueAtIndex wins (load i))
+                    pos (primitive/alloc-stack CGPoint)
+                    size (primitive/alloc-stack CGSize)
+                    pv (ax-get w c"AXPosition")
+                    sv (ax-get w c"AXSize")]
+                (do
+                  (AXValueGetValue pv (primitive/cast i32 AX-POINT) (primitive/cast (ptr i8) pos))
+                  (AXValueGetValue sv (primitive/cast i32 AX-SIZE) (primitive/cast (ptr i8) size))
+                  (print "  pid {d} win: \"" (primitive/cast i64 pid))
+                  (print-cfstr (ax-get w c"AXTitle"))
+                  (println "\" @ ({f},{f}) {f}x{f}"
+                           (load (primitive/field pos x)) (load (primitive/field pos y))
+                           (load (primitive/field size w)) (load (primitive/field size h)))
+                  (set! i (+ (load i) 1)))))
+            n)))))
+
+(defn main [] (-> i64)
+  (do
+    (println "AXIsProcessTrusted = {d}" (primitive/cast i64 (AXIsProcessTrusted)))
+    (let [ws (send0 (objc_getClass c"NSWorkspace") c"sharedWorkspace")
+          apps (send0 ws c"runningApplications")
+          n (send-count apps)
+          (mut i) 0
+          (mut total) 0]
+      (do
+        (println "running apps: {d}" n)
+        (while (< (load i) n)
+          (let [a (send-i64 apps c"objectAtIndex:" (load i))
+                ; activationPolicy 0 = regular (has windows / dock icon)
+                pol (primitive/cast i64 (send0 a c"activationPolicy"))]
+            (do
+              (if (= pol 0)
+                  (set! total (+ (load total) (dump-windows (send-pid a))))
+                  0)
+              (set! i (+ (load i) 1)))))
+        (println "total AX windows: {d}" (load total))
+        ; observe the frontmost app for window move/resize/focus for 10s
+        (let [front (send0 ws c"frontmostApplication")
+              pid (send-pid front)
+              app (AXUIElementCreateApplication pid)
+              obs (primitive/alloc-stack (ptr i8))]
+          (do
+            (AXObserverCreate pid (primitive/fnptr-of on-ax-event) obs)
+            (AXObserverAddNotification (load obs) app (cfstr c"AXWindowMoved") (primitive/cast (ptr i8) 0))
+            (AXObserverAddNotification (load obs) app (cfstr c"AXWindowResized") (primitive/cast (ptr i8) 0))
+            (AXObserverAddNotification (load obs) app (cfstr c"AXFocusedWindowChanged") (primitive/cast (ptr i8) 0))
+            (CFRunLoopAddSource (CFRunLoopGetCurrent)
+                                (AXObserverGetRunLoopSource (load obs))
+                                (cfstr c"kCFRunLoopDefaultMode"))
+            ; nudge the front window right 40px then back, to prove we can move windows
+            (let [win (ax-get app c"AXFocusedWindow")
+                  pos (primitive/alloc-stack CGPoint)]
+              (if (= win (primitive/cast (ptr i8) 0))
+                  (do (println "no focused window on front app (pid {d})" (primitive/cast i64 pid)) 0)
+                  (do
+                    (AXValueGetValue (ax-get win c"AXPosition") (primitive/cast i32 AX-POINT) (primitive/cast (ptr i8) pos))
+                    (let [ox (load (primitive/field pos x))]
+                      (do
+                        (store! (primitive/field pos x) (+ ox 40.0))
+                        (println "move err = {d}"
+                                 (primitive/cast i64 (AXUIElementSetAttributeValue win (cfstr c"AXPosition")
+                                                       (AXValueCreate (primitive/cast i32 AX-POINT) (primitive/cast (ptr i8) pos)))))
+                        (CFRunLoopRunInMode (cfstr c"kCFRunLoopDefaultMode") 0.5 (primitive/cast u8 0))
+                        (store! (primitive/field pos x) ox)
+                        (AXUIElementSetAttributeValue win (cfstr c"AXPosition")
+                                                      (AXValueCreate (primitive/cast i32 AX-POINT) (primitive/cast (ptr i8) pos)))
+                        0)))))
+            (println "listening for events on front app for 3s...")
+            (CFRunLoopRunInMode (cfstr c"kCFRunLoopDefaultMode") 3.0 (primitive/cast u8 0))
+            0))))))

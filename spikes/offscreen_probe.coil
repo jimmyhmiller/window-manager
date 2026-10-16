@@ -1,0 +1,80 @@
+(module offscreen-probe)
+
+(import "coil.primitive" :as primitive)
+(import "coil.io" :use *)
+(import "coil.fmt" :use *)
+(import "coil.str" :use *)
+
+(extern CFStringCreateWithCString :cc c [(ptr i8) (ptr i8) u32] (-> (ptr i8)))
+(extern CFArrayGetValueAtIndex :cc c [(ptr i8) i64] (-> (ptr i8)))
+(extern AXUIElementCreateApplication :cc c [i32] (-> (ptr i8)))
+(extern AXUIElementCopyAttributeValue :cc c [(ptr i8) (ptr i8) (ptr (ptr i8))] (-> i32))
+(extern AXUIElementSetAttributeValue :cc c [(ptr i8) (ptr i8) (ptr i8)] (-> i32))
+(extern AXValueGetValue :cc c [(ptr i8) i32 (ptr i8)] (-> u8))
+(extern AXValueCreate :cc c [i32 (ptr i8)] (-> (ptr i8)))
+(extern getenv :cc c [(ptr i8)] (-> (ptr i8)))
+(extern atoi :cc c [(ptr i8)] (-> i32))
+(extern mach_absolute_time :cc c [] (-> u64))
+
+(defstruct CGPoint [(x f64) (y f64)])
+
+(defn cfstr [(s (ptr i8))] (-> (ptr i8))
+  (CFStringCreateWithCString (primitive/cast (ptr i8) 0) s (primitive/cast u32 134217984)))
+
+(defn get-pos [(w (ptr i8)) (out (ptr CGPoint))] (-> i64)
+  (let [v (primitive/alloc-stack (ptr i8))]
+    (do
+      (AXUIElementCopyAttributeValue w (cfstr c"AXPosition") v)
+      (AXValueGetValue (primitive/load v) (primitive/cast i32 1) (primitive/cast (ptr i8) out))
+      0)))
+
+(defn try-move [(w (ptr i8)) (x f64) (y f64)] (-> i64)
+  (let [p (primitive/alloc-stack CGPoint)
+        q (primitive/alloc-stack CGPoint)]
+    (do
+      (store! (primitive/field p x) x)
+      (store! (primitive/field p y) y)
+      (let [err (AXUIElementSetAttributeValue w (cfstr c"AXPosition") (AXValueCreate (primitive/cast i32 1) (primitive/cast (ptr i8) p)))]
+        (do
+          (get-pos w q)
+          (println "asked ({f},{f}) err={d} -> got ({f},{f})" x y (primitive/cast i64 err)
+                   (load (primitive/field q x)) (load (primitive/field q y)))
+          0)))))
+
+(defn main [] (-> i64)
+  (let [pid (atoi (getenv c"PID"))
+        app (AXUIElementCreateApplication pid)
+        wins (primitive/alloc-stack (ptr i8))]
+    (do
+      (AXUIElementCopyAttributeValue app (cfstr c"AXWindows") wins)
+      (let [w (CFArrayGetValueAtIndex (primitive/load wins) 0)
+            p (primitive/alloc-stack CGPoint)
+            (mut i) 0]
+        (do
+          (get-pos w p)
+          (println "start ({f},{f})" (load (primitive/field p x)) (load (primitive/field p y)))
+          (try-move w -3000.0 200.0)
+          (try-move w -399.0 200.0)
+          (try-move w 9000.0 200.0)
+          (try-move w 2050.0 200.0)
+          (try-move w 200.0 5000.0)
+          (try-move w 200.0 1320.0)
+          (try-move w 200.0 -2000.0)
+          (try-move w 200.0 10.0)
+          ; time 200 moves
+          (let [t0 (mach_absolute_time)]
+            (do
+              (while (< (load i) 200)
+                (do
+                  (try-move-quiet w (primitive/cast f64 (+ 100 (load i))) 300.0)
+                  (set! i (+ (load i) 1))))
+              (println "200 moves: {d} us total (mach ticks/24 on arm64)"
+                       (primitive/cast i64 (/ (- (mach_absolute_time) t0) (primitive/cast u64 24))))))
+          0)))))
+
+(defn try-move-quiet [(w (ptr i8)) (x f64) (y f64)] (-> i64)
+  (let [p (CGPoint :x x :y y)
+        (mut pp) p]
+    (do
+      (AXUIElementSetAttributeValue w (cfstr c"AXPosition") (AXValueCreate (primitive/cast i32 1) (primitive/cast (ptr i8) (mut pp))))
+      0)))

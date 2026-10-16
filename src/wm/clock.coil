@@ -1,0 +1,21 @@
+(module wm.clock)
+(import "coil.primitive" :as primitive)
+
+(extern clock_gettime_nsec_np :cc c [u32] (-> u64))
+
+;; CLOCK_UPTIME_RAW: monotonic, does not advance while asleep
+(const CLOCK-UPTIME-RAW 8)
+
+;;; Monotonic milliseconds.
+(defn now-ms [] (-> i64)
+  (primitive/cast i64
+                  (/ (clock_gettime_nsec_np (primitive/cast u32
+                                                            CLOCK-UPTIME-RAW))
+                     (primitive/cast u64 1000000))))
+
+;;; Monotonic microseconds.
+(defn now-us [] (-> i64)
+  (primitive/cast i64
+                  (/ (clock_gettime_nsec_np (primitive/cast u32
+                                                            CLOCK-UPTIME-RAW))
+                     (primitive/cast u64 1000))))

@@ -1,0 +1,258 @@
+(module wm.peek)
+
+;;; Edge peeks. Screens are independent, so a window panned partly past an
+;;; edge that borders another display cannot stay there — the part past the
+;;; edge would show on that display — and waits hidden instead. A peek keeps
+;;; its visible part on screen as a picture, clipped exactly at the edge, so
+;;; nothing jumps when a pan ends. Clicking a peek pans until its window is
+;;; fully in view, and the real window takes over.
+
+(import "coil.primitive" :as primitive)
+(import "coil.alloc" :use [malloc-allocator])
+(import "coil.arraylist" :use [ArrayList])
+(import "wm.objc" :use *)
+(import "wm.cocoa" :use *)
+(import "wm.model" :as model)
+(import "wm.canvas" :as canvas)
+(import "wm.overlay" :as overlay)
+(import "wm.list" :use [remove-swap!])
+
+(const STYLE-NONACTIVATING-PANEL 128)
+
+(const BACKING-BUFFERED 2)
+
+;; canJoinAllSpaces | stationary | ignoresCycle
+(const COLLECTION-BEHAVIOR 81)
+
+;; NSWindowSharingNone: kept out of every capture, so the pictures the overlay
+;; takes of the desktop never contain a peek
+(const SHARING-NONE 0)
+
+;; Margin left between a window and the edge when a click brings it into view.
+(const BRING-MARGIN 24.0)
+
+(defstruct Peek [(id u32) (window (ptr i8)) (layer (ptr i8)) (view (ptr i8))])
+
+(defstruct Peeks
+  [(peeks (ArrayList Peek))
+   (pan (fnptr c [u32 f64] i64))])
+
+(defn state [] (-> (ptr Peeks))
+  (primitive/alloc-static Peeks))
+
+(defn peek-index [(id u32)] (-> i64)
+  (let [(mut i) 0
+        (mut found) -1]
+    (do
+      (while (and (< i (len (.peeks (state)))) (< found 0))
+        (do
+          (if (= (.id (get (.peeks (state)) i)) id) (set! found i) 0)
+          (set! i (+ i 1))))
+      found)))
+
+;;; Where window `i` really is for its pan (it may be partly off its screen).
+(defn true-rect [(i i64)] (-> CGRect)
+  (let [w (model/win i)]
+    (rect (- (.x (.canvas w)) (model/pan-of (.project w) (.screen w)))
+          (.y (.canvas w))
+          (.w (.size w))
+          (.h (.size w)))))
+
+;;; The part of window `i` a peek shows: the active project's window, waiting
+;;; hidden because it crosses a shared edge, yet partly inside its screen.
+(defn peek-rect [(i i64)] (-> (Option CGRect))
+  (let [w (model/win i)
+        si (model/screen-index (.screen w))]
+    (if (or (< si 0) (!= (.project w) (model/active)) (.minimized w) (.shown w))
+        (None)
+        (let [s (.frame (model/screen-at si))
+              r (true-rect i)
+              left (canvas/max-f (.x r) (.x s))
+              right (canvas/min-f (+ (.x r) (.w r)) (+ (.x s) (.w s)))]
+          (if (< (- right left) 1.0)
+              (None)
+              (Some (rect left (.y r) (- right left) (.h r))))))))
+
+(defn appkit-frame [(r CGRect)] (-> CGRect)
+  (let [primary-h (.h (msg CGRect (main-screen) c"frame" []))]
+    (rect (.x r) (- primary-h (+ (.y r) (.h r))) (.w r) (.h r))))
+
+(defn make-peek! [(id u32)] (-> Peek)
+  (let [window
+          (msg (ptr i8)
+               (send (cls c"NSPanel") c"alloc")
+               c"initWithContentRect:styleMask:backing:defer:"
+               [CGRect u64 u64 u8]
+               (rect 0.0 0.0 10.0 10.0)
+               (primitive/cast u64 STYLE-NONACTIVATING-PANEL)
+               (primitive/cast u64 BACKING-BUFFERED)
+               (primitive/cast u8 0))
+        view (make-view c"WMPeekView" (rect 0.0 0.0 10.0 10.0))
+        layer (new-layer)]
+    (do
+      (msg void window c"setOpaque:" [u8] (primitive/cast u8 0))
+      (msg void window c"setBackgroundColor:" [(ptr i8)] (color c"clearColor"))
+      (msg void window c"setHasShadow:" [u8] (primitive/cast u8 1))
+      (msg void window c"setHidesOnDeactivate:" [u8] (primitive/cast u8 0))
+      (msg void
+           window
+           c"setCollectionBehavior:"
+           [u64]
+           (primitive/cast u64 COLLECTION-BEHAVIOR))
+      (msg void
+           window
+           c"setSharingType:"
+           [u64]
+           (primitive/cast u64 SHARING-NONE))
+      (msg void view c"setLayer:" [(ptr i8)] layer)
+      (msg void view c"setWantsLayer:" [u8] (primitive/cast u8 1))
+      (msg void window c"setContentView:" [(ptr i8)] view)
+      (send view c"release")
+      (Peek
+        :id id
+        :window window
+        :layer layer
+        :view view))))
+
+(defn show-peek! [(p Peek) (i i64) (visible CGRect)] (-> i64)
+  (let [w (model/win i)
+        r (true-rect i)
+        image (overlay/picture-of (.id w) (primitive/cast u32 0))]
+    (do
+      (overlay/no-actions)
+      (msg void
+           (.window p)
+           c"setFrame:display:"
+           [CGRect u8]
+           (appkit-frame visible)
+           (primitive/cast u8 1))
+      (msg void (.layer p) c"setContents:" [(ptr i8)] image)
+      (msg void
+           (.layer p)
+           c"setContentsScale:"
+           [f64]
+           (overlay/scale-of (.screen w)))
+      ;; only the slice of the picture that is inside the screen
+      (msg void
+           (.layer p)
+           c"setContentsRect:"
+           [CGRect]
+           (rect (/ (- (.x visible) (.x r)) (.w r))
+                 0.0
+                 (/ (.w visible) (.w r))
+                 1.0))
+      (overlay/commit)
+      (if (= (msg u8 (.window p) c"isVisible" []) (primitive/cast u8 0))
+          (do (msg void (.window p) c"orderFrontRegardless" []) 0)
+          0)
+      0)))
+
+(defn drop-peek! [(k i64)] (-> i64)
+  (let [p (get (.peeks (state)) k)]
+    (do
+      (msg void (.window p) c"orderOut:" [(ptr i8)] (nil))
+      (msg void (.window p) c"close" [])
+      (remove-swap! (mut (.peeks (state))) k))))
+
+;;; Make the peeks match the windows: one for every window that waits at a
+;;; shared edge while partly inside its screen, none for any other.
+(defn update! [] (-> i64)
+  (let [(mut i) 0
+        (mut k) 0]
+    (do
+      (while (< i (model/win-count))
+        (let [w (model/win i)]
+          (do
+            (match (peek-rect i)
+              (None [] 0)
+              (Some [visible]
+                    (if (nil? (overlay/picture-of (.id w)
+                                                  (primitive/cast u32 0)))
+                        0
+                        (let [existing (peek-index (.id w))]
+                          (if (< existing 0)
+                              (let [p (make-peek! (.id w))]
+                                (do
+                                  (push! (mut (.peeks (state))) p)
+                                  (show-peek! p i visible)))
+                              (show-peek! (get (.peeks (state)) existing)
+                                          i
+                                          visible))))))
+            (set! i (+ i 1)))))
+      (while (< k (len (.peeks (state))))
+        (let [p (get (.peeks (state)) k)
+              wi (model/index-of-id (.id p))]
+          (if (and (>= wi 0)
+                   (match (peek-rect wi) (None [] false) (Some [_] true)))
+              (set! k (+ k 1))
+              (drop-peek! k))))
+      0)))
+
+(defn update-callback [] (-> void)
+  (update!))
+
+;; A click on a peek: pan its screen until the window is fully in view.
+(defn view-mouse-down [(self (ptr i8)) (cmd (ptr i8)) (event (ptr i8))]
+  (-> void)
+  (let [(mut k) 0
+        (mut found) -1]
+    (do
+      (while (and (< k (len (.peeks (state)))) (< found 0))
+        (do
+          (if (= (.view (get (.peeks (state)) k)) self) (set! found k) 0)
+          (set! k (+ k 1))))
+      (if (< found 0)
+          0
+          (let [wi (model/index-of-id (.id (get (.peeks (state)) found)))]
+            (if (< wi 0)
+                0
+                (let [w (model/win wi)
+                      s
+                        (.frame (model/screen-at (model/screen-index (.screen w))))
+                      r (true-rect wi)
+                      dx
+                        (if (< (.x r) (.x s))
+                            (+ (- (.x s) (.x r)) BRING-MARGIN)
+                            (- (- (+ (.x s) (.w s)) (+ (.x r) (.w r)))
+                               BRING-MARGIN))]
+                  (call-ptr (.pan (state)) (.screen w) dx))))))))
+
+(defn view-accepts-first-mouse [(self (ptr i8)) (cmd (ptr i8)) (event (ptr i8))]
+  (-> u8)
+  (primitive/cast u8 1))
+
+;; Pictures refresh in the background; keep the peeks' pictures current.
+(defn on-tick [(self (ptr i8)) (cmd (ptr i8)) (timer (ptr i8))] (-> void)
+  (if (model/interacting?) 0 (update!)))
+
+;;; `pan` pans a screen by a distance (an eased step), for clicks on peeks.
+(defn init! [(pan (fnptr c [u32 f64] i64))] (-> i64)
+  (let [view-class (begin-class c"WMPeekView" c"NSView")
+        timer-class (begin-class c"WMPeekRefresher" c"NSObject")]
+    (do
+      (add-method view-class
+                  c"mouseDown:"
+                  (primitive/cast (ptr i8) (fnptr-of view-mouse-down))
+                  c"v@:@")
+      (add-method view-class
+                  c"acceptsFirstMouse:"
+                  (primitive/cast (ptr i8) (fnptr-of view-accepts-first-mouse))
+                  c"B@:@")
+      (finish-class view-class)
+      (add-method timer-class
+                  c"tick:"
+                  (primitive/cast (ptr i8) (fnptr-of on-tick))
+                  c"v@:@")
+      (finish-class timer-class)
+      (set! (.peeks (state)) (ArrayList::new [Peek] (malloc-allocator)))
+      (set! (.pan (state)) pan)
+      (msg (ptr i8)
+           (cls c"NSTimer")
+           c"scheduledTimerWithTimeInterval:target:selector:userInfo:repeats:"
+           [f64 (ptr i8) (ptr i8) (ptr i8) u8]
+           1.0
+           (send (send timer-class c"alloc") c"init")
+           (sel c"tick:")
+           (nil)
+           (primitive/cast u8 1))
+      0)))

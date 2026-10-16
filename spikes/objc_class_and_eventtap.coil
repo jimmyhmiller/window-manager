@@ -1,0 +1,35 @@
+(module objc-class-and-eventtap)
+
+(import "coil.primitive" :as primitive)
+(import "coil.io" :use *)
+(import "coil.fmt" :use *)
+
+(extern objc_getClass :cc c [(ptr i8)] (-> (ptr i8)))
+(extern sel_registerName :cc c [(ptr i8)] (-> (ptr i8)))
+(extern objc_msgSend :cc c [(ptr i8) (ptr i8)] (-> (ptr i8)))
+(extern objc_allocateClassPair :cc c [(ptr i8) (ptr i8) i64] (-> (ptr i8)))
+(extern objc_registerClassPair :cc c [(ptr i8)] (-> void))
+(extern class_addMethod :cc c [(ptr i8) (ptr i8) (fnptr c [(ptr i8) (ptr i8) i64] i64) (ptr i8)] (-> u8))
+(extern CGEventTapCreate :cc c [u32 u32 u32 u64 (fnptr c [(ptr i8) u32 (ptr i8) (ptr i8)] (ptr i8)) (ptr i8)] (-> (ptr i8)))
+(extern CFMachPortInvalidate :cc c [(ptr i8)] (-> void))
+
+; IMP: -(long)triple:(long)x
+(defn wm-triple [(self (ptr i8)) (cmd (ptr i8)) (x i64)] (-> i64) (* x 3))
+
+(defn on-key [(proxy (ptr i8)) (ty u32) (ev (ptr i8)) (refcon (ptr i8))] (-> (ptr i8)) ev)
+
+(defn main [] (-> i64)
+  (let [cls (objc_allocateClassPair (objc_getClass c"NSObject") c"CoilWMObserver" 0)]
+    (do
+      (class_addMethod cls (sel_registerName c"triple:") (primitive/fnptr-of wm-triple) c"q@:q")
+      (objc_registerClassPair cls)
+      (let [obj (objc_msgSend (objc_msgSend cls (sel_registerName c"alloc")) (sel_registerName c"init"))
+            r (primitive/call-ptr (primitive/cast (fnptr c [(ptr i8) (ptr i8) i64] i64) (primitive/fnptr-of objc_msgSend))
+                                  obj (sel_registerName c"triple:") 14)]
+        (println "runtime-defined ObjC method returned {d}" r))
+      ; kCGSessionEventTap=1, kCGHeadInsertEventTap=0, kCGEventTapOptionListenOnly=1, mask = keyDown(10)
+      (let [tap (CGEventTapCreate (primitive/cast u32 1) (primitive/cast u32 0) (primitive/cast u32 1)
+                                  (primitive/cast u64 1024) (primitive/fnptr-of on-key) (primitive/cast (ptr i8) 0))]
+        (if (= tap (primitive/cast (ptr i8) 0))
+            (do (println "event tap: NOT created (no permission)") 0)
+            (do (println "event tap: created") (CFMachPortInvalidate tap) 0))))))

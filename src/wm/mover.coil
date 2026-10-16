@@ -1,0 +1,288 @@
+(module wm.mover)
+
+;;; Window moves run on one thread per application. Accessibility calls are
+;;; synchronous IPC into the target app, so a slow or hung app must not hold up
+;;; the others. Each window has one slot holding its latest target; targets a
+;;; thread had no time to apply are simply replaced, never queued.
+;;;
+;;; `request!`, `forget-window!`, and `stop-app!` are called on the main thread.
+
+(import "coil.primitive" :as primitive)
+(import "coil.alloc" :use [malloc-allocator box! destroy])
+(import "coil.arraylist" :use [ArrayList])
+(import "coil.thread" :use [Thread])
+(import "coil.sync" :use [Mutex Condition])
+(import "wm.objc" :use [nil nil? pool-push pool-pop])
+(import "wm.ax" :as ax)
+(import "wm.clock" :use [now-ms])
+(import "wm.list" :use [remove-swap!])
+
+(extern pthread_detach :cc c [(ptr i8)] (-> i32))
+
+;; A pause this long between batches re-reads AXEnhancedUserInterface.
+(const EUI-RECHECK-MS 250)
+
+(defstruct Slot [(element (ptr i8)) (x f64) (y f64) (dirty bool)])
+
+(defstruct Mover
+  [(pid i32)
+   (app (ptr i8))
+   (mutex Mutex)
+   (wake Condition)
+   (slots (ArrayList Slot))
+   (alive bool)
+   (applying bool)
+   (thread Thread)])
+
+(defn movers [] (-> (ptr (ArrayList (ptr Mover))))
+  (primitive/alloc-static (ArrayList (ptr Mover))))
+
+(defn ok! [(r (Result i64 coil.sync/SyncError)) (what (ptr i8))] (-> i64)
+  (match r
+    (Ok [_] 0)
+    (Err [_] (panic "mover: pthread call failed"))))
+
+(defn lock! [(m (ptr Mover))] (-> i64)
+  (ok! (Mutex::lock! (field m mutex)) c"lock"))
+
+(defn unlock! [(m (ptr Mover))] (-> i64)
+  (ok! (Mutex::unlock! (field m mutex)) c"unlock"))
+
+(defn find-mover [(pid i32)] (-> i64)
+  (let [(mut i) 0
+        (mut found) -1]
+    (do
+      (while (and (< i (len (load (movers)))) (< found 0))
+        (do
+          (if (= (.pid (get (load (movers)) i)) pid) (set! found i) 0)
+          (set! i (+ i 1))))
+      found)))
+
+(defn find-slot [(m (ptr Mover)) (element (ptr i8))] (-> i64)
+  (let [(mut i) 0
+        (mut found) -1]
+    (do
+      (while (and (< i (len (.slots m))) (< found 0))
+        (do
+          (if (= (.element (get (.slots m) i)) element) (set! found i) 0)
+          (set! i (+ i 1))))
+      found)))
+
+;; ---- the per-app thread ----
+
+(defn apply-batch [(m (ptr Mover)) (batch (ptr (ArrayList Slot))) (eui bool)]
+  (-> i64)
+  (let [(mut i) 0]
+    (do
+      (if eui (do (ax/set-enhanced-ui! (.app m) false) 0) 0)
+      (while (< i (len (load batch)))
+        (let [s (get (load batch) i)]
+          (do
+            (ax/set-position! (.element s) (.x s) (.y s))
+            (ax/release (.element s))
+            (set! i (+ i 1)))))
+      (if eui (do (ax/set-enhanced-ui! (.app m) true) 0) 0)
+      (clear! batch))))
+
+(defn any-dirty? [(m (ptr Mover))] (-> bool)
+  (let [(mut i) 0
+        (mut dirty) false]
+    (do
+      (while (and (< i (len (.slots m))) (not dirty))
+        (do
+          (if (.dirty (get (.slots m) i)) (set! dirty true) 0)
+          (set! i (+ i 1))))
+      dirty)))
+
+;;; Move every dirty slot into `batch` (each element retained) and mark it clean.
+(defn take-dirty! [(m (ptr Mover)) (batch (ptr (ArrayList Slot)))] (-> i64)
+  (let [(mut i) 0]
+    (do
+      (while (< i (len (.slots m)))
+        (let [s (get (.slots m) i)]
+          (do
+            (if (.dirty s)
+                (do
+                  (push! batch
+                         (Slot
+                           :element (ax/retain (.element s))
+                           :x (.x s)
+                           :y (.y s)
+                           :dirty false))
+                  (set! (mut (.slots m))
+                        i
+                        (Slot
+                          :element (.element s)
+                          :x (.x s)
+                          :y (.y s)
+                          :dirty false))
+                  0)
+                0)
+            (set! i (+ i 1)))))
+      (len (load batch)))))
+
+(defn teardown! [(m (ptr Mover))] (-> i64)
+  (let [(mut i) 0]
+    (do
+      (while (< i (len (.slots m)))
+        (do
+          (ax/release (.element (get (.slots m) i)))
+          (set! i (+ i 1))))
+      (free! (mut (.slots m)))
+      (ax/release (.app m))
+      (ok! (Condition::destroy! (field m wake)) c"cond destroy")
+      (ok! (Mutex::destroy! (field m mutex)) c"mutex destroy")
+      (destroy [Mover] (malloc-allocator) m))))
+
+(defn run [(arg (ptr i8))] (-> (ptr i8))
+  (let [m (primitive/cast (ptr Mover) arg)
+        (mut batch) (ArrayList::new [Slot] (malloc-allocator))
+        (mut last-batch-ms) 0
+        (mut eui) false]
+    (do
+      (loop (do
+              (lock! m)
+              (while (and (.alive m) (not (any-dirty? m)))
+                (ok! (Condition::wait! (field m wake) (field m mutex)) c"wait"))
+              (if (not (.alive m))
+                  (do (unlock! m) (break 0))
+                  (do
+                    (take-dirty! m (mut batch))
+                    (set! (.applying m) true)
+                    (unlock! m)
+                    (if (> (- (now-ms) last-batch-ms) EUI-RECHECK-MS)
+                        (do (set! eui (ax/enhanced-ui? (.app m))) 0)
+                        0)
+                    (let [pool (pool-push)]
+                      (do
+                        (apply-batch m (mut batch) eui)
+                        (pool-pop pool)))
+                    (set! last-batch-ms (now-ms))
+                    (lock! m)
+                    (set! (.applying m) false)
+                    (unlock! m)
+                    0))))
+      (free! (mut batch))
+      (teardown! m)
+      (nil))))
+
+;; ---- main thread ----
+
+(defn start! [(pid i32)] (-> (ptr Mover))
+  (let [m
+          (box! (malloc-allocator)
+                Mover
+                (Mover
+                  :pid pid
+                  :app (ax/copy-app pid)
+                  :mutex (zeroed Mutex)
+                  :wake (zeroed Condition)
+                  :slots (ArrayList::new [Slot] (malloc-allocator))
+                  :alive true
+                  :applying false
+                  :thread (zeroed Thread)))]
+    (do
+      (match (Mutex::init (field m mutex))
+        (Ok [_] 0)
+        (Err [_] (panic "mover: mutex init failed")))
+      (match (Condition::init (field m wake))
+        (Ok [_] 0)
+        (Err [_] (panic "mover: condition init failed")))
+      (if (!= (Thread::spawn (field m thread)
+                             (fnptr-of run)
+                             (primitive/cast (ptr i8) m))
+              (primitive/cast i32 0))
+          (panic "mover: thread spawn failed")
+          0)
+      (pthread_detach (.handle (.thread m)))
+      (push! (movers) m)
+      m)))
+
+(defn mover-for! [(pid i32)] (-> (ptr Mover))
+  (let [i (find-mover pid)]
+    (if (< i 0) (start! pid) (get (load (movers)) i))))
+
+;;; Ask for `element` (a window of `pid`) to be moved to (x, y).
+(defn request! [(pid i32) (element (ptr i8)) (x f64) (y f64)] (-> i64)
+  (let [m (mover-for! pid)]
+    (do
+      (lock! m)
+      (let [i (find-slot m element)]
+        (if (< i 0)
+            (push! (mut (.slots m))
+                   (Slot
+                     :element (ax/retain element)
+                     :x x
+                     :y y
+                     :dirty true))
+            (set! (mut (.slots m))
+                  i
+                  (Slot
+                    :element element
+                    :x x
+                    :y y
+                    :dirty true))))
+      (ok! (Condition::notify-one! (field m wake)) c"notify")
+      (unlock! m))))
+
+;;; True while a move of `element` (a window of `pid`) is waiting or its app's
+;;; thread is applying moves.
+(defn window-busy? [(pid i32) (element (ptr i8))] (-> bool)
+  (let [mi (find-mover pid)]
+    (if (< mi 0)
+        false
+        (let [m (get (load (movers)) mi)]
+          (do
+            (lock! m)
+            (let [si (find-slot m element)
+                  busy
+                    (or (.applying m)
+                        (and (>= si 0) (.dirty (get (.slots m) si))))]
+              (do (unlock! m) busy)))))))
+
+;;; True when every app's thread has applied every move asked of it.
+(defn all-idle? [] (-> bool)
+  (let [(mut i) 0
+        (mut idle) true]
+    (do
+      (while (and idle (< i (len (load (movers)))))
+        (let [m (get (load (movers)) i)]
+          (do
+            (lock! m)
+            (if (or (.applying m) (any-dirty? m)) (set! idle false) 0)
+            (unlock! m)
+            (set! i (+ i 1)))))
+      idle)))
+
+;;; Drop a closed window's slot.
+(defn forget-window! [(pid i32) (element (ptr i8))] (-> i64)
+  (let [i (find-mover pid)]
+    (if (< i 0)
+        0
+        (let [m (get (load (movers)) i)]
+          (do
+            (lock! m)
+            (let [s (find-slot m element)]
+              (if (< s 0)
+                  0
+                  (do
+                    (ax/release (.element (get (.slots m) s)))
+                    (remove-swap! (mut (.slots m)) s)
+                    0)))
+            (unlock! m))))))
+
+;;; Stop an app's thread (it frees itself once its current batch finishes).
+(defn stop-app! [(pid i32)] (-> i64)
+  (let [i (find-mover pid)]
+    (if (< i 0)
+        0
+        (let [m (get (load (movers)) i)]
+          (do
+            (remove-swap! (movers) i)
+            (lock! m)
+            (set! (.alive m) false)
+            (ok! (Condition::notify-one! (field m wake)) c"notify")
+            (unlock! m))))))
+
+(defn init! [] (-> i64)
+  (do (set! (movers) (ArrayList::new [(ptr Mover)] (malloc-allocator))) 0))

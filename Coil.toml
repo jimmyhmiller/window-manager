@@ -1,0 +1,7 @@
+[package]
+name = "wm"
+entry = "src/main.coil"
+
+[link]
+libs = ["objc"]
+frameworks = ["AppKit", "ApplicationServices", "QuartzCore", "ScreenCaptureKit", "CoreMedia", "CoreVideo"]
